@@ -67,9 +67,29 @@ jobs:
     # secrets, by design, so the reviewer cannot run -- and reporting that as
     # a failure tells an outside contributor their PR is broken when the panel
     # is simply not available to it. Skipping says the same thing honestly.
+    #
+    # Dependabot pull requests are skipped for a DIFFERENT and stronger reason:
+    # their diff is attacker-influenced. A lockfile or manifest entry comes
+    # from the registry, so a compromised package controls text that this
+    # reviewer reads -- while the reviewer runs with sandbox_mode
+    # danger-full-access and the API key in its environment. A prompt injection
+    # in that diff could exfiltrate the key. Every other PR the panel reviews
+    # comes from a branch someone with push access wrote.
+    #
+    # Reviewing them anyway was tried and reverted. It needs the key in the
+    # Dependabot secret store, and that is precisely what hands an
+    # attacker-influenced diff a live credential. The review was not worth it:
+    # an LLM reading "fast-uri 3.1.2 -> 3.1.5" cannot tell whether the package
+    # is malicious. Dependabot's own advisories and CodeQL do that work.
+    #
+    # The test is the PR's AUTHOR, not github.actor. Checking the actor would
+    # leave the dangerous case open -- a human re-running or labelling a
+    # Dependabot PR makes the actor human, which is exactly when Actions
+    # secrets DO become available to that attacker-influenced diff.
     if: >-
       github.event.pull_request.draft == false &&
-      github.event.pull_request.head.repo.fork == false
+      github.event.pull_request.head.repo.fork == false &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     # Literal, not an expression: job-level timeout-minutes does not accept
     # one, and the run fails at startup with no usable message when it does.

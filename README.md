@@ -104,6 +104,24 @@ reviewer to run something on the runner. Fork pull requests do not receive
 secrets, so an outside contributor cannot reach the key, and the job holds only
 `contents: read` and `pull-requests: write`.
 
+**Dependabot pull requests are skipped**, and that is a security decision
+rather than a limitation. Their diff is attacker-influenced — a lockfile entry
+comes from the registry, so a compromised package controls text the reviewer
+reads, while the reviewer runs unsandboxed with the key in its environment.
+Every other PR the panel sees comes from a branch someone with push access
+wrote.
+
+Reviewing them was tried and reverted: it requires the key in the Dependabot
+secret store, which is exactly what hands an attacker-influenced diff a live
+credential. The review earned little — an LLM reading `fast-uri 3.1.2 → 3.1.5`
+cannot tell whether the package is malicious; Dependabot's advisories and CodeQL
+do that. Revisit only with a dedicated, spend-limited key **and** a reviewer that
+cannot run commands.
+
+The skip tests the PR's **author**, not `github.actor`: a human re-running or
+labelling a Dependabot PR makes the actor human, which is exactly when Actions
+secrets do become available to that diff.
+
 ## The one prerequisite
 
 Each repo needs an `OPENAI_API_KEY` secret.
