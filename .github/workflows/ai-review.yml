@@ -150,7 +150,16 @@ jobs:
           # The CLI does not pick the key up from the environment: it looks for
           # a stored credential and falls back to interactive session auth,
           # which on a runner means every request comes back 401.
-          printenv OPENAI_API_KEY | codex login --with-api-key
+          #
+          # Not allowed to abort the step. A repo with no OPENAI_API_KEY fails
+          # right here, and under `set -e` that killed the job before anything
+          # could write review.md -- so the run died on an unhandled ENOENT
+          # instead of saying which secret was missing. The one case the panel
+          # most needs to explain was the one it explained worst.
+          set +e
+          printenv OPENAI_API_KEY | codex login --with-api-key > login.log 2>&1
+          login_status=$?
+          set -e
 
           # Effort is set explicitly. Without it the CLI reviewed at effort
           # "none" here, because there is no config.toml on a runner -- a
@@ -177,15 +186,20 @@ jobs:
           # stderr. Verified against this pinned version; a review with P1
           # findings still exits 0, so the exit code reports whether the
           # reviewer RAN, never what it thought.
+          : > verdict.md
+          : > transcript.md
+          codex_status=0
           set +e
-          codex review \
-            --base "$BASE" \
-            --title "$TITLE" \
-            -c sandbox_mode="danger-full-access" \
-            -c model="$MODEL" \
-            -c model_reasoning_effort="$EFFORT" \
-            > verdict.md 2> transcript.md
-          codex_status=$?
+          if [ "$login_status" -eq 0 ]; then
+            codex review \
+              --base "$BASE" \
+              --title "$TITLE" \
+              -c sandbox_mode="danger-full-access" \
+              -c model="$MODEL" \
+              -c model_reasoning_effort="$EFFORT" \
+              > verdict.md 2> transcript.md
+            codex_status=$?
+          fi
           set -e
 
           # Did the reviewer actually run? Opinions never fail the build; this
@@ -208,7 +222,9 @@ jobs:
           # reviewed correctly. A health check must never read text its subject
           # controls.
           reviewer_failed=
-          if [ "$codex_status" -ne 0 ]; then
+          if [ "$login_status" -ne 0 ]; then
+            reviewer_failed="the reviewer could not authenticate; is OPENAI_API_KEY set on this repo?"
+          elif [ "$codex_status" -ne 0 ]; then
             reviewer_failed="the reviewer exited $codex_status"
           elif ! grep -q '[^[:space:]]' verdict.md; then
             reviewer_failed="the reviewer produced no review"
@@ -245,8 +261,14 @@ jobs:
               echo
               echo "<details><summary>Reviewer diagnostics</summary>"
               echo
-              echo "Exit status: \`$codex_status\`"
+              echo "Login status: \`$login_status\` | review exit status: \`$codex_status\`"
               echo
+              if [ -s login.log ]; then
+                echo '```'
+                tail -c 800 login.log
+                echo '```'
+                echo
+              fi
               echo '```'
               tail -c 4000 transcript.md
               echo '```'

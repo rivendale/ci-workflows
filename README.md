@@ -33,7 +33,7 @@ shape can override them without forking the workflow.
 
 ## Adding a repo
 
-Copy `ai-review-caller.template.yml` into the repo as
+Copy `templates/ai-review-caller.yml` into the repo as
 `.github/workflows/ai-review.yml`, or run `scripts/rollout-ai-review.sh` from
 this repo to open the PRs in bulk.
 

@@ -15,19 +15,26 @@ sed -n '/^          reviewer_failed=$/,/^          fi$/p' "$WF" \
 [ -s "$WORK/detector.sh" ] || { echo "FAIL: could not extract the detector"; exit 1; }
 
 pass=0; fail=0
-check() { # name expected_failed exit_code stdout stderr
-  local name=$1 expected=$2 code=$3 out=$4 err=$5
+check() { # name expected exit_code stdout stderr [login_status] [reason_substring]
+  # The reason matters as much as the verdict: "no OPENAI_API_KEY on this repo"
+  # and "the reviewer produced no review" are both failures, but only one tells
+  # you what to do, and a check that conflated them would look tested here
+  # while giving the wrong answer in every repo missing the key.
+  local name=$1 expected=$2 code=$3 out=$4 err=$5 login=${6:-0} want=${7:-}
   # codex_status and the two files ARE the detector's inputs. It is sourced at
   # a computed path, so the linter can neither see the use nor follow it.
   # shellcheck disable=SC2034,SC1091
   ( cd "$WORK" && printf '%s' "$out" > verdict.md && printf '%s' "$err" > transcript.md \
-    && codex_status=$code && . ./detector.sh \
+    && codex_status=$code && login_status=$login && . ./detector.sh \
+    && printf '%s' "$reviewer_failed" > reason \
     && if [ -n "$reviewer_failed" ]; then echo FAILED; else echo RAN; fi ) > "$WORK/got" 2>/dev/null
-  local got; got=$(cat "$WORK/got")
-  if [ "$got" = "$expected" ]; then
-    pass=$((pass + 1)); printf '  ok    %s\n' "$name"
-  else
+  local got reason; got=$(cat "$WORK/got"); reason=$(cat "$WORK/reason" 2>/dev/null || true)
+  if [ "$got" != "$expected" ]; then
     fail=$((fail + 1)); printf '  NOT OK %s -- expected %s, got %s\n' "$name" "$expected" "$got"
+  elif [ -n "$want" ] && [[ "$reason" != *"$want"* ]]; then
+    fail=$((fail + 1)); printf '  NOT OK %s -- reason should mention %s, said: %s\n' "$name" "$want" "$reason"
+  else
+    pass=$((pass + 1)); printf '  ok    %s\n' "$name"
   fi
 }
 
@@ -65,6 +72,9 @@ check "whitespace-only verdict"     FAILED 0 "
 # catch it. Without this the exit-code branch is dead weight no test covers.
 check "partial verdict then a crash" FAILED 1 "The change looks" "banner
 stream error: connection reset"
+# A repo with no OPENAI_API_KEY. Login fails, the review never runs, and the
+# panel has to say which secret is missing rather than die on a missing file.
+check "no key on the repo"          FAILED 0 "" "" 1 "OPENAI_API_KEY"
 
 echo
 echo "Mutations (each MUST break at least one fixture):"
@@ -90,6 +100,7 @@ mutate() { # name sed-expression
     check "no verdict, exit 0"          FAILED 0 "" "banner"
     check "whitespace-only verdict"     FAILED 0 "   " "banner"
     check "partial verdict then a crash" FAILED 1 "The change looks" "banner"
+    check "no key on the repo"          FAILED 0 "" "" 1 "OPENAI_API_KEY"
     echo "MUTANTFAIL=$fail"; } 2>&1 )
   fail=$before
   local mfail; mfail=$(printf '%s' "$quiet" | sed -n 's/.*MUTANTFAIL=//p')
@@ -107,6 +118,9 @@ mutate "ignore the exit code"        's/if \[ "\$codex_status" -ne 0 \]; then/if
 mutate "ignore an empty verdict"     's/elif ! grep -q .\[^\[:space:\]\]. verdict.md; then/elif false; then/'
 mutate "accept a whitespace-only verdict" \
   "s|elif ! grep -q '\\[^\\[:space:\\]\\]' verdict.md; then|elif [ ! -s verdict.md ]; then|"
+# These are sed scripts, not shell expansions.
+# shellcheck disable=SC2016
+mutate "ignore a failed login"       's/if \[ "\$login_status" -ne 0 \]; then/if false; then/'
 mutate "grep the transcript again (the original bug)" \
   's|elif ! grep -q .\[^\[:space:\]\]. verdict.md; then|elif grep -qE "401 Unauthorized\|bwrap:" transcript.md; then|'
 

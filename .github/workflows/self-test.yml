@@ -15,8 +15,9 @@ on:
     # merge without running it.
     paths:
       - '.github/workflows/ai-review.yml'
-      - '.github/workflows/ai-review-caller.template.yml'
+      - 'templates/ai-review-caller.yml'
       - '.github/workflows/self-test.yml'
+      - '.github/workflows/self-review.yml'
       - 'scripts/detector-test.sh'
       - 'scripts/rollout-ai-review.sh'
   push:
@@ -45,8 +46,9 @@ jobs:
           python3 - <<'PY'
           import yaml, sys
           for f in ('.github/workflows/ai-review.yml',
-                    '.github/workflows/ai-review-caller.template.yml',
-                    '.github/workflows/self-test.yml'):
+                    '.github/workflows/self-review.yml',
+                    '.github/workflows/self-test.yml',
+                    'templates/ai-review-caller.yml'):
               yaml.safe_load(open(f))
               print('ok', f)
           PY
@@ -63,7 +65,7 @@ jobs:
           python3 - <<'PY'
           import sys, yaml
           a = yaml.safe_load(open('/tmp/rollout-caller.yml'))
-          b = yaml.safe_load(open('.github/workflows/ai-review-caller.template.yml'))
+          b = yaml.safe_load(open('templates/ai-review-caller.yml'))
           # Whole document, not a handful of fields. A spot-check on `uses` and
           # `permissions` still passes when the two drift on secret forwarding
           # or concurrency -- and a template that stopped forwarding
