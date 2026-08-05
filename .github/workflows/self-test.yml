@@ -1,0 +1,71 @@
+name: Self-test
+
+# The panel decides whether a review actually happened, and that decision is
+# what every other repo trusts. It gets tested here, on its own PRs, because a
+# panel that silently stops detecting failures reports every PR as clean.
+#
+# The suite also mutates the detector and asserts each mutation breaks a
+# fixture, so a check that has quietly become unreachable fails loudly rather
+# than passing by accident.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ai-review.yml'
+      - 'scripts/detector-test.sh'
+      - '.github/workflows/self-test.yml'
+  push:
+    branches: [main]
+
+concurrency:
+  group: self-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint the shell
+        run: |
+          shellcheck --version
+          shellcheck scripts/detector-test.sh scripts/rollout-ai-review.sh
+
+      - name: The panel's YAML parses
+        run: |
+          python3 - <<'PY'
+          import yaml, sys
+          for f in ('.github/workflows/ai-review.yml',
+                    '.github/workflows/ai-review-caller.template.yml',
+                    '.github/workflows/self-test.yml'):
+              yaml.safe_load(open(f))
+              print('ok', f)
+          PY
+
+      - name: The caller template matches the one the rollout writes
+        # Two copies of the caller exist -- the template a human copies and the
+        # heredoc the script writes. They drifted once already; this makes
+        # drifting fail here rather than in whichever repo got the stale one.
+        run: |
+          set -euo pipefail
+          HOST=rivendale/ci-workflows
+          eval "$(sed -n '/^read -r -d/,/^YAML$/p' scripts/rollout-ai-review.sh)"
+          printf '%s\n' "$CALLER" > /tmp/rollout-caller.yml
+          python3 - <<'PY'
+          import yaml
+          a = yaml.safe_load(open('/tmp/rollout-caller.yml'))
+          b = yaml.safe_load(open('.github/workflows/ai-review-caller.template.yml'))
+          # Compare meaning, not comments or key order.
+          assert a['jobs']['panel']['uses'] == b['jobs']['panel']['uses'], (
+              a['jobs']['panel']['uses'], b['jobs']['panel']['uses'])
+          assert a['jobs']['panel']['permissions'] == b['jobs']['panel']['permissions']
+          assert a[True] == b[True], 'the pull_request triggers differ'
+          print('caller template and rollout heredoc agree')
+          PY
+
+      - name: Detector fixtures and mutations
+        run: ./scripts/detector-test.sh

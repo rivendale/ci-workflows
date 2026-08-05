@@ -1,18 +1,11 @@
 # AI review panel
 
-The one AI code review definition for rivendale repos. Callers name no model;
-they declare what changed and this decides which tier reviews it.
+One reusable workflow, called by every repo that wants AI review on its pull
+requests. Callers name no model: they declare what changed and the panel decides
+which tier reviews it, so tiering, cost controls and comment behaviour change in
+one file rather than in a dozen copies.
 
-One reusable workflow, called by every rivendale repo that wants AI review on
-its pull requests. Centralised so the model tiering, the cost controls and the
-comment behaviour are changed in one file rather than in a dozen copies.
-
-Protocol Wealth repos are out of scope. They live under the `Protocol-Wealth`
-org and are reviewed under a separate process.
-
-`pwgraph-core` is in scope despite the prefix: it is the family brain behind
-brain.rygiel.family, in this account, personal/family only. It is not a
-Protocol Wealth repo and should not be dropped for matching "pw".
+See [Scope](#scope) for which repos are wired in.
 
 ## Tiers
 
@@ -71,6 +64,33 @@ So the panel lives here, public, and any repo can call it regardless of its own
 visibility. Nothing here is sensitive; it is CI logic. The key stays a per-repo
 secret and never appears in this repo.
 
+## Telling "reviewed and fine" from "never reviewed"
+
+A review that did not happen must never read as a clean one, so the panel
+decides explicitly and fails the check when the reviewer did not run. It judges
+that on two things the reviewer cannot forge:
+
+- a non-zero exit code, and
+- an empty stdout.
+
+That works because the CLI splits its streams: **stdout is the finished review**,
+**stderr is the working transcript** — every command the reviewer ran and
+everything those commands printed. If the model was unreachable there is no
+review on stdout, and nothing on stderr can fill it in.
+
+What the panel deliberately does *not* do is grep the transcript for error
+strings. It used to, and the result was instructive: a PR that edited this
+workflow made the reviewer print this file, error patterns and all, so the panel
+matched its own source code and announced that it was broken — on a PR it had
+just reviewed correctly. A health check must never read text its subject
+controls.
+
+`scripts/detector-test.sh` pins this down. It runs the real decision logic,
+lifted out of the workflow rather than restated, against fixtures including that
+exact self-match. It then mutates the logic and asserts each mutation breaks a
+fixture, so a check that has quietly become unreachable fails loudly instead of
+passing by accident. `Self-test` runs it on every PR that touches the panel.
+
 ## Sandbox
 
 The reviewer runs with its own sandbox disabled. Bubblewrap cannot configure a
@@ -95,9 +115,20 @@ does that for you if `OPENAI_API_KEY` is exported when you run it.
 The Codex CLI's interactive session auth (`~/.codex/auth.json`) does **not**
 work in Actions. It needs a real API key.
 
+## Scope
+
+Every active, non-fork repo in `rivendale`, plus the **open-source** Protocol
+Wealth repos (`nexus-core`, `pwcli-core`, `pwos-core`, `pwplan-core`,
+`shard-core`, `pw-learnai`), which the public host makes reachable. The private
+Protocol Wealth repos stay out; they are reviewed under a separate process.
+
+`pwgraph-core` is in scope despite the prefix: it is the family brain behind
+brain.rygiel.family, in this personal account, personal/family only. It is not a
+Protocol Wealth repo and should not be dropped for matching "pw".
+
 ## Cost shape
 
-These repos are private, so Actions minutes bill. The panel is deliberately
+Private repos bill Actions minutes. The panel is deliberately
 lean: pull requests only, drafts skipped, `cancel-in-progress` so a force-push
 does not pay for two reviews, and a hard timeout because a hung review still
 bills.

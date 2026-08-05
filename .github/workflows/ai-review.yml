@@ -171,9 +171,12 @@ jobs:
           # `--sandbox` is a top-level flag, not a `review` one; the config key
           # is how the subcommand takes it.
           #
-          # The exit code is captured rather than discarded. An OPINION exits 0,
-          # however critical it is; anything non-zero means the reviewer did not
-          # run, and that must not pass as a clean review.
+          # Two files, because the CLI splits them meaningfully: the finished
+          # review goes to stdout, and the working transcript -- every command
+          # the reviewer ran and everything those commands printed -- goes to
+          # stderr. Verified against this pinned version; a review with P1
+          # findings still exits 0, so the exit code reports whether the
+          # reviewer RAN, never what it thought.
           set +e
           codex review \
             --base "$BASE" \
@@ -181,60 +184,71 @@ jobs:
             -c sandbox_mode="danger-full-access" \
             -c model="$MODEL" \
             -c model_reasoning_effort="$EFFORT" \
-            > raw-review.md 2>&1
+            > verdict.md 2> transcript.md
           codex_status=$?
           set -e
 
-          # Drop the CLI's preamble and sandbox warnings; the comment should be
-          # the review, not the tool's banner.
-          sed -e '/^OpenAI Codex v/d' \
-              -e '/^workdir:/d' -e '/^model:/d' -e '/^provider:/d' \
-              -e '/^approval:/d' -e '/^sandbox:/d' -e '/^reasoning /d' \
-              -e '/^session id:/d' -e '/^--------$/d' \
-              -e '/could not find bubblewrap/d' \
-              -e '/^user$/d' -e "/^changes against/d" \
-              raw-review.md | sed '/./,$!d' > clean-review.md
+          # Did the reviewer actually run? Opinions never fail the build; this
+          # does, because a review that did not happen must not read as a clean
+          # one.
+          #
+          # Every signal here is one the reviewer cannot forge:
+          #
+          #   1. A non-zero exit.
+          #   2. A stdout with nothing in it. If the model was unreachable
+          #      there is no verdict, and no amount of text on stderr can fill
+          #      this in. Whitespace does not count: a blank review that posts
+          #      under a green check is the exact failure this guards against.
+          #
+          # What this deliberately no longer does is grep the transcript for
+          # error strings. The transcript holds whatever the reviewer printed --
+          # files it read, pages it fetched -- so a PR that edited THIS FILE
+          # made the reviewer print it, error patterns and all, and the panel
+          # matched its own source and declared itself broken on a PR it had
+          # reviewed correctly. A health check must never read text its subject
+          # controls.
+          reviewer_failed=
+          if [ "$codex_status" -ne 0 ]; then
+            reviewer_failed="the reviewer exited $codex_status"
+          elif ! grep -q '[^[:space:]]' verdict.md; then
+            reviewer_failed="the reviewer produced no review"
+          fi
 
-          # The CLI prints its command transcript, then the review itself under a
-          # final `codex` line. Lead with the review; keep the transcript, since
-          # it is what makes a wrong review diagnosable, but fold it away.
-          last_marker=$(grep -n '^codex$' clean-review.md | tail -1 | cut -d: -f1 || true)
-          if [ -n "${last_marker:-}" ]; then
-            tail -n "+$((last_marker + 1))" clean-review.md > verdict.md
-            head -n "$((last_marker - 1))" clean-review.md > transcript.md
+          if [ -z "$reviewer_failed" ]; then
+            # Lead with the review. Keep the transcript, since it is what makes
+            # a wrong review diagnosable, but fold it away; drop the banner,
+            # which is just the tool announcing itself.
+            sed -e '/^OpenAI Codex v/d' \
+                -e '/^workdir:/d' -e '/^model:/d' -e '/^provider:/d' \
+                -e '/^approval:/d' -e '/^sandbox:/d' -e '/^reasoning /d' \
+                -e '/^session id:/d' -e '/^--------$/d' \
+                -e '/could not find bubblewrap/d' \
+                -e '/^user$/d' -e "/^changes against/d" \
+                transcript.md | sed '/./,$!d' > transcript-clean.md
             {
               cat verdict.md
               echo
               echo "<details><summary>How it got there</summary>"
               echo
               echo '```'
-              tail -c 20000 transcript.md
+              tail -c 20000 transcript-clean.md
               echo '```'
               echo
               echo "</details>"
             } > review.md
           else
-            cp clean-review.md review.md
-          fi
-
-          # A reviewer that could not run is an infrastructure failure, not an
-          # opinion, and must not pass as a clean review. Opinions never fail
-          # the build; this does.
-          # Exit code first, then a net for the cases that fail while still
-          # exiting 0: auth retries, a sandbox that cannot start, and a reviewer
-          # that says outright it could not read the diff.
-          if [ "$codex_status" -ne 0 ] \
-             || grep -qE "401 Unauthorized|Reconnecting\.\.\.|failed to connect|bwrap:|Unable to inspect" raw-review.md; then
             echo "reviewer_failed=true" >> "$GITHUB_OUTPUT"
             {
-              echo "**The review did not run.** The panel could not reach the model, so this PR has NOT been reviewed."
+              echo "**The review did not run.** This PR has NOT been reviewed: $reviewer_failed."
               echo
               echo "Usually a missing or invalid \`OPENAI_API_KEY\` on this repo."
               echo
-              echo "<details><summary>Reviewer output</summary>"
+              echo "<details><summary>Reviewer diagnostics</summary>"
+              echo
+              echo "Exit status: \`$codex_status\`"
               echo
               echo '```'
-              tail -c 3000 raw-review.md
+              tail -c 4000 transcript.md
               echo '```'
               echo
               echo "</details>"
