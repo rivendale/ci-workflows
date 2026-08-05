@@ -1,0 +1,294 @@
+name: AI review panel
+
+# The one AI code review definition for every rivendale repo.
+#
+# Callers do not choose a model. They declare how much the change is worth
+# reviewing and this decides, so the tiering lives in one file instead of
+# drifting across a dozen caller workflows:
+#
+#   luna  ($0.20 / $1.20 per MTok)  routine changes, the default
+#   terra ($2.00 / $12.00)          anything touching a sensitive path
+#   sol   ($5.00 / $30.00)          asked for explicitly, by label or dispatch
+#
+# Protocol Wealth repos are deliberately out of scope; they live in the
+# Protocol-Wealth org and are reviewed under a separate process.
+
+on:
+  workflow_call:
+    inputs:
+      base:
+        description: Branch to review against.
+        type: string
+        default: main
+      # Underscores, not hyphens: `-` is subtraction in a GitHub expression, so
+      # `inputs.sensitive-paths` parses as `inputs.sensitive - paths` and the
+      # run fails at startup before a single step executes.
+      sensitive_paths:
+        description: |
+          Newline-separated globs that force the mid tier. Defaults cover the
+          things whose failure modes are expensive: auth, secrets, database
+          schema, CI definitions, and dependency manifests.
+        type: string
+        default: |
+          **/auth/**
+          **/identity/**
+          **/guardian/**
+          **/credentials*
+          **/*secret*
+          **/db/**
+          **/*.sql
+          .github/workflows/**
+          **/package.json
+          **/pnpm-lock.yaml
+          **/requirements*.txt
+      escalate_label:
+        description: PR label that forces the top tier.
+        type: string
+        default: deep-review
+    secrets:
+      OPENAI_API_KEY:
+        description: |
+          API key for the reviewer. The Codex CLI's interactive session auth
+          does NOT work here; CI needs a real key.
+        required: true
+
+# One review per PR. A force-push while a review is running should cancel it
+# rather than pay for both.
+concurrency:
+  group: ai-review-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Drafts are not ready to be reviewed and would otherwise be reviewed on
+    # every push.
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    # Literal, not an expression: job-level timeout-minutes does not accept
+    # one, and the run fails at startup with no usable message when it does.
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The reviewer diffs against the base branch, so it needs history.
+          fetch-depth: 0
+
+      - name: Materialise the base branch
+        env:
+          BASE: ${{ inputs.base }}
+        run: |
+          set -euo pipefail
+          # checkout leaves a detached HEAD at the PR's merge ref, so there is no
+          # local branch for `--base` to resolve and the reviewer aborts with
+          # "no such branch". fetch-depth: 0 means the objects are already here;
+          # this only gives them a local name.
+          git fetch --no-tags origin "+refs/heads/$BASE:refs/heads/$BASE" 2>/dev/null \
+            || git branch -f "$BASE" "origin/$BASE"
+          git rev-parse --verify "$BASE" >/dev/null
+
+      - name: Choose the tier
+        id: tier
+        env:
+          SENSITIVE_PATHS: ${{ inputs.sensitive_paths }}
+          ESCALATE_LABEL: ${{ inputs.escalate_label }}
+          BASE: ${{ inputs.base }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+
+          # An explicit ask wins over everything else.
+          if printf '%s' "$LABELS" | grep -qi "\"$ESCALATE_LABEL\""; then
+            echo "model=gpt-5.6-sol" >> "$GITHUB_OUTPUT"
+            echo "effort=high" >> "$GITHUB_OUTPUT"
+            echo "reason=labelled $ESCALATE_LABEL" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed=$(git diff --name-only "origin/$BASE"...HEAD || true)
+          while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            while IFS= read -r file; do
+              [ -z "$file" ] && continue
+              # shellcheck disable=SC2254 -- the pattern is a glob on purpose
+              case "$file" in
+                $pattern)
+                  echo "model=gpt-5.6-terra" >> "$GITHUB_OUTPUT"
+                  echo "effort=high" >> "$GITHUB_OUTPUT"
+                  echo "reason=touches $file" >> "$GITHUB_OUTPUT"
+                  exit 0
+                  ;;
+              esac
+            done <<< "$changed"
+          done <<< "$SENSITIVE_PATHS"
+
+          echo "model=gpt-5.6-luna" >> "$GITHUB_OUTPUT"
+          echo "effort=medium" >> "$GITHUB_OUTPUT"
+          echo "reason=routine change" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install the reviewer
+        # Pinned: an unpinned reviewer changes underneath every repo at once,
+        # and a CLI whose flags moved would fail twelve pipelines together.
+        run: npm install -g @openai/codex@0.146.0
+
+      - name: Review
+        id: review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODEL: ${{ steps.tier.outputs.model }}
+          EFFORT: ${{ steps.tier.outputs.effort }}
+          BASE: ${{ inputs.base }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          # The CLI does not pick the key up from the environment: it looks for
+          # a stored credential and falls back to interactive session auth,
+          # which on a runner means every request comes back 401.
+          printenv OPENAI_API_KEY | codex login --with-api-key
+
+          # Effort is set explicitly. Without it the CLI reviewed at effort
+          # "none" here, because there is no config.toml on a runner -- a
+          # reviewer that is not thinking is worse than no reviewer, since it
+          # still reads as a clean review.
+          # The CLI's own sandbox cannot start here: bubblewrap fails to
+          # configure a network namespace inside the runner, and every git
+          # command the reviewer tried came back as a bwrap error. The runner is
+          # already the isolation boundary -- ephemeral, per-job, and holding
+          # only a read-scoped token plus the review key -- so the wrapper is
+          # dropped rather than the review being impossible.
+          #
+          # This does mean model-generated commands run unsandboxed on the
+          # runner. Fork pull requests do not receive secrets, so an outside
+          # contributor cannot reach the key; a trusted-branch PR carrying a
+          # prompt injection is the residual risk, bounded by the job's
+          # permissions being contents:read and pull-requests:write.
+          # `--sandbox` is a top-level flag, not a `review` one; the config key
+          # is how the subcommand takes it.
+          #
+          # The exit code is captured rather than discarded. An OPINION exits 0,
+          # however critical it is; anything non-zero means the reviewer did not
+          # run, and that must not pass as a clean review.
+          set +e
+          codex review \
+            --base "$BASE" \
+            --title "$TITLE" \
+            -c sandbox_mode="danger-full-access" \
+            -c model="$MODEL" \
+            -c model_reasoning_effort="$EFFORT" \
+            > raw-review.md 2>&1
+          codex_status=$?
+          set -e
+
+          # Drop the CLI's preamble and sandbox warnings; the comment should be
+          # the review, not the tool's banner.
+          sed -e '/^OpenAI Codex v/d' \
+              -e '/^workdir:/d' -e '/^model:/d' -e '/^provider:/d' \
+              -e '/^approval:/d' -e '/^sandbox:/d' -e '/^reasoning /d' \
+              -e '/^session id:/d' -e '/^--------$/d' \
+              -e '/could not find bubblewrap/d' \
+              -e '/^user$/d' -e "/^changes against/d" \
+              raw-review.md | sed '/./,$!d' > clean-review.md
+
+          # The CLI prints its command transcript, then the review itself under a
+          # final `codex` line. Lead with the review; keep the transcript, since
+          # it is what makes a wrong review diagnosable, but fold it away.
+          last_marker=$(grep -n '^codex$' clean-review.md | tail -1 | cut -d: -f1 || true)
+          if [ -n "${last_marker:-}" ]; then
+            tail -n "+$((last_marker + 1))" clean-review.md > verdict.md
+            head -n "$((last_marker - 1))" clean-review.md > transcript.md
+            {
+              cat verdict.md
+              echo
+              echo "<details><summary>How it got there</summary>"
+              echo
+              echo '```'
+              tail -c 20000 transcript.md
+              echo '```'
+              echo
+              echo "</details>"
+            } > review.md
+          else
+            cp clean-review.md review.md
+          fi
+
+          # A reviewer that could not run is an infrastructure failure, not an
+          # opinion, and must not pass as a clean review. Opinions never fail
+          # the build; this does.
+          # Exit code first, then a net for the cases that fail while still
+          # exiting 0: auth retries, a sandbox that cannot start, and a reviewer
+          # that says outright it could not read the diff.
+          if [ "$codex_status" -ne 0 ] \
+             || grep -qE "401 Unauthorized|Reconnecting\.\.\.|failed to connect|bwrap:|Unable to inspect" raw-review.md; then
+            echo "reviewer_failed=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "**The review did not run.** The panel could not reach the model, so this PR has NOT been reviewed."
+              echo
+              echo "Usually a missing or invalid \`OPENAI_API_KEY\` on this repo."
+              echo
+              echo "<details><summary>Reviewer output</summary>"
+              echo
+              echo '```'
+              tail -c 3000 raw-review.md
+              echo '```'
+              echo
+              echo "</details>"
+            } > review.md
+          fi
+          # Never fail the build on the reviewer's opinion. This panel reports;
+          # the human decides. A reviewer outage must not block a merge.
+          test -s review.md || echo "The reviewer produced no output." > review.md
+
+      - name: Post the review
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          MODEL: ${{ steps.tier.outputs.model }}
+          EFFORT: ${{ steps.tier.outputs.effort }}
+          REASON: ${{ steps.tier.outputs.reason }}
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('review.md', 'utf8').slice(0, 60000);
+            const marker = '<!-- rivendale-ai-review -->';
+            const header = `${marker}\n### AI review panel — \`${process.env.MODEL}\` (effort ${process.env.EFFORT})\n_Tier chosen because: ${process.env.REASON}._\n\n`;
+
+            // Replace this panel's previous comment rather than stacking one
+            // per push, so the thread stays readable.
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo, issue_number: context.issue.number, per_page: 100,
+            });
+            const existing = comments.find((c) => c.body?.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body: header + body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body: header + body });
+            }
+
+      - name: Fail if the reviewer never ran
+        if: steps.review.outputs.reviewer_failed == 'true'
+        run: |
+          echo "::error::The AI review panel could not reach the model; this PR was not reviewed."
+          exit 1
+
+      - name: Summarise on the run
+        if: always()
+        env:
+          MODEL: ${{ steps.tier.outputs.model }}
+          EFFORT: ${{ steps.tier.outputs.effort }}
+          REASON: ${{ steps.tier.outputs.reason }}
+        run: |
+          {
+            echo "## AI review panel"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Model | \`$MODEL\` |"
+            echo "| Reasoning effort | $EFFORT |"
+            echo "| Tier reason | $REASON |"
+          } >> "$GITHUB_STEP_SUMMARY"

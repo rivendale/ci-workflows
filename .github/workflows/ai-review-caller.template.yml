@@ -1,0 +1,37 @@
+# Template. Copy to a repo as `.github/workflows/ai-review.yml`.
+#
+# Deliberately does not name a model. Tiering lives in the reusable workflow so
+# it can be changed in one place; a caller that picked its own model would be
+# the thing this centralisation exists to avoid.
+#
+# Requires the org secret OPENAI_API_KEY. The Codex CLI's interactive session
+# auth does not work in Actions.
+
+name: AI review
+
+on:
+  pull_request:
+    # `unlabeled` too: removing a tier label emits that, not `labeled`, so
+    # without it a stale deep-tier run keeps going and posts a result for a
+    # tier the PR no longer asks for.
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+# Keyed to the PR, not the branch: a rapid second push or a label change would
+# otherwise start an independent run, spend Actions minutes and model tokens on
+# a commit that is already superseded, and race to post the comment. The panel's
+# own concurrency group governs its jobs but cannot cancel this caller's run.
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  panel:
+    # Required. A called workflow cannot request more permission than its
+    # caller holds, and the default token is read-only, so omitting this fails
+    # the run at startup with no usable message.
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: rivendale/ci-workflows/.github/workflows/ai-review.yml@main
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
