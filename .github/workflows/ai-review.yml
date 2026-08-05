@@ -62,7 +62,14 @@ jobs:
   review:
     # Drafts are not ready to be reviewed and would otherwise be reviewed on
     # every push.
-    if: github.event.pull_request.draft == false
+    #
+    # Fork pull requests are skipped, not failed. GitHub does not give them
+    # secrets, by design, so the reviewer cannot run -- and reporting that as
+    # a failure tells an outside contributor their PR is broken when the panel
+    # is simply not available to it. Skipping says the same thing honestly.
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.fork == false
     runs-on: ubuntu-latest
     # Literal, not an expression: job-level timeout-minutes does not accept
     # one, and the run fails at startup with no usable message when it does.
@@ -275,7 +282,7 @@ jobs:
               echo
               echo "<details><summary>Reviewer diagnostics</summary>"
               echo
-              echo "Login status: \`$login_status\` | review exit status: \`$codex_status\`"
+              echo "Login status: \`$login_status\` | review exit: \`$codex_status\` | key characters seen: \`$key_chars\`"
               echo
               if [ -s login.log ]; then
                 echo '```'
