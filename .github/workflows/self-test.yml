@@ -10,10 +10,15 @@ name: Self-test
 
 on:
   pull_request:
+    # Both caller definitions are listed. This workflow is the only thing that
+    # compares them, so a PR touching just one of them must not be able to
+    # merge without running it.
     paths:
       - '.github/workflows/ai-review.yml'
-      - 'scripts/detector-test.sh'
+      - '.github/workflows/ai-review-caller.template.yml'
       - '.github/workflows/self-test.yml'
+      - 'scripts/detector-test.sh'
+      - 'scripts/rollout-ai-review.sh'
   push:
     branches: [main]
 
@@ -56,14 +61,22 @@ jobs:
           eval "$(sed -n '/^read -r -d/,/^YAML$/p' scripts/rollout-ai-review.sh)"
           printf '%s\n' "$CALLER" > /tmp/rollout-caller.yml
           python3 - <<'PY'
-          import yaml
+          import sys, yaml
           a = yaml.safe_load(open('/tmp/rollout-caller.yml'))
           b = yaml.safe_load(open('.github/workflows/ai-review-caller.template.yml'))
-          # Compare meaning, not comments or key order.
-          assert a['jobs']['panel']['uses'] == b['jobs']['panel']['uses'], (
-              a['jobs']['panel']['uses'], b['jobs']['panel']['uses'])
-          assert a['jobs']['panel']['permissions'] == b['jobs']['panel']['permissions']
-          assert a[True] == b[True], 'the pull_request triggers differ'
+          # Whole document, not a handful of fields. A spot-check on `uses` and
+          # `permissions` still passes when the two drift on secret forwarding
+          # or concurrency -- and a template that stopped forwarding
+          # OPENAI_API_KEY would hand every copying repo a caller that cannot
+          # satisfy the panel's required secret. Parsing drops comments and key
+          # order, so this compares meaning.
+          if a != b:
+              for k in sorted(set(a) | set(b), key=str):
+                  if a.get(k) != b.get(k):
+                      print(f'DIFFERS at {k!r}:', file=sys.stderr)
+                      print('  rollout heredoc:', a.get(k), file=sys.stderr)
+                      print('  caller template:', b.get(k), file=sys.stderr)
+              sys.exit('caller template and rollout heredoc have drifted')
           print('caller template and rollout heredoc agree')
           PY
 
