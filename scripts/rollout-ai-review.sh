@@ -27,6 +27,11 @@ set -euo pipefail
 APPLY=${1:-}
 HOST=rivendale/ci-workflows
 WORKFLOW=.github/workflows/ai-review.yml
+# Where the caller goes when ai-review.yml is already taken by a panel rather
+# than a caller. A repo that HOSTS a panel cannot use the ordinary filename
+# without overwriting the thing it calls, and the alternative to a second name
+# is leaving that repo unreviewed.
+SELF_WORKFLOW=.github/workflows/self-review.yml
 BRANCH=chore/ai-review-panel
 
 # Owner-qualified: the open-source Protocol Wealth repos are in their own org.
@@ -86,26 +91,36 @@ jobs:
       OPENAI_API_KEY: \${{ secrets.OPENAI_API_KEY }}
 YAML
 
-# Reads the caller already in a repo, if any. Empty when there is none.
-caller_of() {
-  gh api "repos/$1/contents/$WORKFLOW" --jq '.content' 2>/dev/null \
+# Reads a workflow file from a repo. Empty when there is none.
+file_at() {
+  gh api "repos/$1/contents/$2" --jq '.content' 2>/dev/null \
     | tr -d '\n' | base64 -d 2>/dev/null || true
+}
+
+# Decides where this repo's caller belongs and what state it is in. Echoes
+# "<path> <state>", where state is one of: wired, repoint, add.
+plan_for() {
+  local repo=$1 path=$WORKFLOW body
+  body=$(file_at "$repo" "$WORKFLOW")
+  if [ -n "$body" ] && ! printf '%s' "$body" | grep -q 'uses: .*/\.github/workflows/ai-review\.yml'; then
+    # ai-review.yml here is a panel, not a caller. Use the other name.
+    path=$SELF_WORKFLOW
+    body=$(file_at "$repo" "$SELF_WORKFLOW")
+  fi
+  if printf '%s' "$body" | grep -q "uses: $HOST/"; then
+    echo "$path wired"
+  elif printf '%s' "$body" | grep -q 'uses: '; then
+    echo "$path repoint"
+  else
+    echo "$path add"
+  fi
 }
 
 if [ "$APPLY" != "--apply" ]; then
   echo "DRY RUN. ${#REPOS[@]} repos:"
   for repo in "${REPOS[@]}"; do
-    body=$(caller_of "$repo")
-    if printf '%s' "$body" | grep -q "uses: $HOST"; then
-      state="already on the public host"
-    elif printf '%s' "$body" | grep -q 'uses: .*/\.github/workflows/ai-review\.yml'; then
-      state="REPOINT -- calls $(printf '%s' "$body" | grep -oP 'uses: \K[^/]+/[^/]+' || true)"
-    elif [ -n "$body" ]; then
-      state="has an ai-review.yml that is not a caller; SKIPPED"
-    else
-      state="add"
-    fi
-    printf '  %-38s %s\n' "$repo" "$state"
+    read -r path state <<< "$(plan_for "$repo")"
+    printf '  %-38s %-8s %s\n' "$repo" "$state" "$path"
   done
   echo
   echo "Re-run with --apply to open the PRs."
@@ -116,19 +131,10 @@ fi
 for repo in "${REPOS[@]}"; do
   echo "--- $repo"
 
-  body=$(caller_of "$repo")
-  if printf '%s' "$body" | grep -q "uses: $HOST"; then
+  read -r path action <<< "$(plan_for "$repo")"
+  if [ "$action" = wired ]; then
     echo "    already on the public host, skipping"
-  elif [ -n "$body" ] && ! printf '%s' "$body" | grep -q 'uses: .*/\.github/workflows/ai-review\.yml'; then
-    # Something else owns this path -- the panel's own definition, most
-    # likely. Overwriting it with a caller would delete the panel.
-    echo "    ai-review.yml exists and is not a caller; NOT touching it"
   else
-    # Not `grep -q ... && action=repoint`: under `set -e` a bare AND-list that
-    # ends non-zero aborts the script, so a repo with no caller would kill the
-    # whole rollout instead of getting one.
-    action=add
-    if printf '%s' "$body" | grep -q 'uses: '; then action=repoint; fi
     tmp=$(mktemp -d)
     gh repo clone "$repo" "$tmp/r" -- --depth 1 --quiet 2>/dev/null
     (
@@ -136,8 +142,16 @@ for repo in "${REPOS[@]}"; do
       default=$(gh repo view "$repo" --json defaultBranchRef -q .defaultBranchRef.name)
       git checkout -q -b "$BRANCH"
       mkdir -p .github/workflows
-      printf '%s\n' "$CALLER" > "$WORKFLOW"
-      git add "$WORKFLOW"
+      if [ "$path" = "$SELF_WORKFLOW" ]; then
+        # This repo hosts a panel at ai-review.yml, so the caller takes a
+        # different name and says why.
+        printf '%s\n' "$CALLER" \
+          | sed "1a # Named self-review.yml because ai-review.yml in this repo is a panel." \
+          > "$path"
+      else
+        printf '%s\n' "$CALLER" > "$path"
+      fi
+      git add "$path"
       if [ "$action" = repoint ]; then
         subject="ci: call the AI review panel from its public host"
         detail="A public repo cannot call a reusable workflow in a private one, so
