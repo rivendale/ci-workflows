@@ -39,6 +39,10 @@ BRANCH=chore/ai-review-panel
 #   gh repo list rivendale --limit 100 --no-archived \
 #     --json name,isFork -q '.[] | select(.isFork | not) | .name'
 REPOS=(
+  # The host itself. It needs no caller added -- self-review.yml already calls
+  # the panel -- but it does need the key, and leaving it out of this list is
+  # how it ended up as the one repo whose secret nobody kept in sync.
+  rivendale/ci-workflows
   rivendale/rygiel-family
   rivendale/rygiel-shared
   rivendale/pwgraph-core
