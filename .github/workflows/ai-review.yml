@@ -156,9 +156,23 @@ jobs:
           # could write review.md -- so the run died on an unhandled ENOENT
           # instead of saying which secret was missing. The one case the panel
           # most needs to explain was the one it explained worst.
+          #
+          # An EMPTY key is checked for first, and it is not a hypothetical:
+          # `gh secret set NAME` reading the value from a pipe stored nothing,
+          # the login below still printed "Successfully logged in" because it
+          # does not validate, and every request then came back
+          # "401 Missing bearer or basic authentication in header" -- which
+          # reads like a bad key rather than an absent one. Counting the
+          # characters keeps the key itself out of any variable.
           set +e
-          printenv OPENAI_API_KEY | codex login --with-api-key > login.log 2>&1
-          login_status=$?
+          key_chars=$(printenv OPENAI_API_KEY | tr -d '[:space:]' | wc -c)
+          if [ "$key_chars" -eq 0 ]; then
+            echo "OPENAI_API_KEY is empty on this repository." > login.log
+            login_status=1
+          else
+            printenv OPENAI_API_KEY | codex login --with-api-key > login.log 2>&1
+            login_status=$?
+          fi
           set -e
 
           # Effort is set explicitly. Without it the CLI reviewed at effort

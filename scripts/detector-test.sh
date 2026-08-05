@@ -23,9 +23,10 @@ check() { # name expected exit_code stdout stderr [login_status] [reason_substri
   local name=$1 expected=$2 code=$3 out=$4 err=$5 login=${6:-0} want=${7:-}
   # codex_status and the two files ARE the detector's inputs. It is sourced at
   # a computed path, so the linter can neither see the use nor follow it.
-  # shellcheck disable=SC2034,SC1091
+  # shellcheck disable=SC2034,SC1091,SC2030
   ( cd "$WORK" && printf '%s' "$out" > verdict.md && printf '%s' "$err" > transcript.md \
-    && codex_status=$code && login_status=$login && . ./detector.sh \
+    && codex_status=$code && login_status=$login \
+    && . ./detector.sh \
     && printf '%s' "$reviewer_failed" > reason \
     && if [ -n "$reviewer_failed" ]; then echo FAILED; else echo RAN; fi ) > "$WORK/got" 2>/dev/null
   local got reason; got=$(cat "$WORK/got"); reason=$(cat "$WORK/reason" 2>/dev/null || true)
@@ -75,6 +76,39 @@ stream error: connection reset"
 # A repo with no OPENAI_API_KEY. Login fails, the review never runs, and the
 # panel has to say which secret is missing rather than die on a missing file.
 check "no key on the repo"          FAILED 0 "" "" 1 "OPENAI_API_KEY"
+
+echo
+echo "Empty-key guard:"
+# Lifted from the workflow the same way, for the same reason. An absent key is
+# the most common way a newly wired repo fails, and the CLI logs in happily
+# with nothing, so this guard is the only thing standing between a missing
+# secret and a confusing 401.
+sed -n '/^          key_chars=/,/^          fi$/p' "$WF" | sed 's/^          //' > "$WORK/guard.sh"
+[ -s "$WORK/guard.sh" ] || { echo "  NOT OK could not extract the guard"; fail=$((fail + 1)); }
+
+guard() { # name value expected_login_status
+  local name=$1 expected=$3 got
+  # The stub must DRAIN stdin. `pipefail` is still in force inside the step --
+  # `set +e` turns off errexit only -- so a codex that exits without reading
+  # the key makes printenv die on SIGPIPE and the pipeline reports 141. Real
+  # codex reads it; a stub that does not was measuring its own shortcut.
+  # login_status is set by the sourced guard, at a path the linter cannot
+  # follow, and read back out of the same subshell.
+  # shellcheck disable=SC2030,SC2031,SC2317,SC1091
+  got=$( export OPENAI_API_KEY="$2"
+         codex() { cat > /dev/null; echo "Successfully logged in"; return 0; }
+         cd "$WORK" && . ./guard.sh >/dev/null 2>&1
+         echo "${login_status:-unset}" )
+  if [ "$got" = "$expected" ]; then
+    pass=$((pass + 1)); printf '  ok    %s\n' "$name"
+  else
+    fail=$((fail + 1)); printf '  NOT OK %s -- expected login_status %s, got %s\n' "$name" "$expected" "$got"
+  fi
+}
+
+guard "no key at all"      ""                1
+guard "whitespace only"    "   "             1
+guard "a plausible key"    "sk-proj-abc123"  0
 
 echo
 echo "Mutations (each MUST break at least one fixture):"
