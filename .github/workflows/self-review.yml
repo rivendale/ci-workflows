@@ -1,0 +1,32 @@
+# The panel reviewing its own pull requests.
+#
+# A separate filename on purpose: `.github/workflows/ai-review.yml` is the
+# panel itself in this repo, so the caller cannot use the name every other repo
+# uses without overwriting the thing it calls.
+#
+# This used to happen by accident. The caller template lived in
+# `.github/workflows/`, where GitHub treats every .yml as a live workflow, so
+# the template ran as a real caller on every PR. It now lives in `templates/`
+# and this file is the deliberate version.
+name: AI review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  panel:
+    permissions:
+      contents: read
+      pull-requests: write
+    # Deliberately @main, not the PR's own ref: a PR is reviewed by the panel
+    # that is actually deployed, so a change that breaks the reviewer cannot
+    # review itself into looking fine. `Self-test` is what checks the new
+    # version, and it runs on the PR's code.
+    uses: rivendale/ci-workflows/.github/workflows/ai-review.yml@main
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
