@@ -101,35 +101,51 @@ file_at() {
     | tr -d '\n' | base64 -d 2>/dev/null || true
 }
 
+# Is this file a caller for the panel? The test is a job that `uses:` a
+# reusable ai-review workflow -- NOT the mere presence of "uses:", which every
+# workflow on earth contains via actions/checkout. Getting that wrong meant any
+# unrelated self-review.yml was classified as a caller and then overwritten.
+is_caller() {
+  printf '%s' "$1" | grep -qE 'uses: [^/[:space:]]+/[^/[:space:]]+/\.github/workflows/ai-review\.yml@'
+}
+
+is_host_caller() {
+  printf '%s' "$1" | grep -q "uses: $HOST/.github/workflows/ai-review.yml@"
+}
+
 # Decides where this repo's caller belongs and what state it is in. Echoes
-# "<path> <state>", where state is one of: wired, repoint, add.
+# "<path> <state>", where state is one of: wired, repoint, add, blocked.
 #
 # BOTH filenames are examined before concluding anything is missing. An earlier
 # version only looked at self-review.yml when ai-review.yml existed and was a
 # panel; once the panel was deleted from rygiel-shared, ai-review.yml was simply
 # absent, so the rollout decided that repo had no caller and opened a PR adding
-# a second one beside the self-review.yml already doing the job. Two callers
-# share a concurrency group, so they would have cancelled each other.
+# a second one beside the self-review.yml already doing the job.
+#
+# Nothing is ever written over a file that is not already a caller. If both
+# names are occupied by something else, the repo is reported `blocked` and left
+# alone: silently replacing a repo's CI is worse than not wiring it.
 plan_for() {
   local repo=$1 body self_body
   body=$(file_at "$repo" "$WORKFLOW")
   self_body=$(file_at "$repo" "$SELF_WORKFLOW")
 
-  # An existing caller wins, whichever name it goes by.
-  if printf '%s' "$body" | grep -q "uses: $HOST/"; then
+  if is_host_caller "$body"; then
     echo "$WORKFLOW wired"
-  elif printf '%s' "$self_body" | grep -q "uses: $HOST/"; then
+  elif is_host_caller "$self_body"; then
     echo "$SELF_WORKFLOW wired"
-  elif printf '%s' "$body" | grep -q 'uses: '; then
+  elif is_caller "$body"; then
     echo "$WORKFLOW repoint"
-  elif printf '%s' "$self_body" | grep -q 'uses: '; then
+  elif is_caller "$self_body"; then
     echo "$SELF_WORKFLOW repoint"
-  elif [ -n "$body" ]; then
-    # No caller anywhere, and ai-review.yml is taken by something that is not
-    # one -- a panel. Adding there would overwrite it.
+  elif [ -z "$body" ]; then
+    echo "$WORKFLOW add"
+  elif [ -z "$self_body" ]; then
+    # ai-review.yml is taken by something that is not a caller -- a panel, most
+    # likely. self-review.yml is free, so the caller goes there.
     echo "$SELF_WORKFLOW add"
   else
-    echo "$WORKFLOW add"
+    echo "- blocked"
   fi
 }
 
@@ -137,7 +153,11 @@ if [ "$APPLY" != "--apply" ]; then
   echo "DRY RUN. ${#REPOS[@]} repos:"
   for repo in "${REPOS[@]}"; do
     read -r path state <<< "$(plan_for "$repo")"
-    printf '  %-38s %-8s %s\n' "$repo" "$state" "$path"
+    if [ "$state" = blocked ]; then
+      printf '  %-38s %-8s both filenames are taken by non-callers; NEEDS A HUMAN\n' "$repo" "$state"
+    else
+      printf '  %-38s %-8s %s\n' "$repo" "$state" "$path"
+    fi
   done
   echo
   echo "Re-run with --apply to open the PRs."
@@ -149,7 +169,11 @@ for repo in "${REPOS[@]}"; do
   echo "--- $repo"
 
   read -r path action <<< "$(plan_for "$repo")"
-  if [ "$action" = wired ]; then
+  if [ "$action" = blocked ]; then
+    # Both ai-review.yml and self-review.yml exist and neither is a caller.
+    # Writing to either would delete CI this script did not create.
+    echo "    ai-review.yml AND self-review.yml are both taken by non-callers; NOT touching this repo"
+  elif [ "$action" = wired ]; then
     echo "    already on the public host, skipping"
   else
     tmp=$(mktemp -d)
