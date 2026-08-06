@@ -128,6 +128,26 @@ if [ -n "$FIXTURES_ONLY" ]; then
   exit
 fi
 
+# The parser is a hard dependency. If it goes missing the script must refuse to
+# run, because "no caller found anywhere" and "cannot tell" look identical to
+# plan_for, and the second one would add duplicate callers to wired repos.
+echo
+echo "Parser dependency:"
+stub=$(mktemp -d)
+printf '#!/bin/sh\nexit 1\n' > "$stub/python3"
+chmod +x "$stub/python3"
+if out=$(PATH="$stub:$PATH" bash "$SCRIPT" 2>&1); then
+  printf '  NOT OK script ran with no YAML parser (exit 0); it must refuse\n'
+  fail=$((fail + 1))
+elif printf '%s' "$out" | grep -qi "PyYAML"; then
+  printf '  ok    refuses to run without a YAML parser, and says why\n'
+  pass=$((pass + 1))
+else
+  printf '  NOT OK exited non-zero but never mentioned the parser: %s\n' "$out"
+  fail=$((fail + 1))
+fi
+rm -rf "$stub"
+
 echo
 echo "Mutations:"
 mutate() { # name sed-expression [caught|survives]

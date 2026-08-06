@@ -101,6 +101,20 @@ file_at() {
     | tr -d '\n' | base64 -d 2>/dev/null || true
 }
 
+# The parser is a hard dependency, checked before anything is decided.
+#
+# Without this the failure is silent and inverted: a missing PyYAML makes
+# job_uses return nothing, every repo then looks like it has no caller, and
+# --apply cheerfully adds a SECOND caller to repos that were already wired --
+# the exact duplication the parser was introduced to prevent. A tool that
+# cannot tell wired from unwired must refuse to act, not guess.
+python3 -c 'import yaml' 2>/dev/null || {
+  echo "rollout-ai-review: needs python3 with PyYAML (pip install pyyaml)." >&2
+  echo "  Without it, callers cannot be identified and this script would" >&2
+  echo "  treat every repo as unwired and create duplicate callers." >&2
+  exit 1
+}
+
 # The `uses:` value of every JOB in a workflow, via a real YAML parse.
 #
 # Grep on the raw text cannot do this correctly, and two review passes proved
