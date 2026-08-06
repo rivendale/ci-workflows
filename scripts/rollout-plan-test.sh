@@ -25,6 +25,7 @@ SELF_WORKFLOW=.github/workflows/self-review.yml
 # Pull in is_caller/is_host_caller/plan_for without running the rollout.
 eval "$(sed -n '/^job_uses()/,/^}$/p'        "$SCRIPT")"
 eval "$(sed -n '/^is_caller()/,/^}$/p'      "$SCRIPT")"
+eval "$(sed -n '/^is_local_caller()/,/^}$/p' "$SCRIPT")"
 eval "$(sed -n '/^is_host_caller()/,/^}$/p' "$SCRIPT")"
 eval "$(sed -n '/^plan_for()/,/^}$/p'       "$SCRIPT")"
 declare -F plan_for >/dev/null || { echo "FAIL: could not load plan_for"; exit 1; }
@@ -117,6 +118,13 @@ SPACED="jobs:
     uses:    rivendale/rygiel-shared/.github/workflows/ai-review.yml@main"
 FILES=( ["k $WORKFLOW"]="$SPACED" )
 check "caller with extra whitespace"      k "$WORKFLOW repoint"
+
+# A repo running its own panel: local caller, no @ref. Reported, not repointed.
+LOCAL_CALLER="jobs:
+  panel:
+    uses: ./.github/workflows/ai-review.yml"
+FILES=( ["m $WORKFLOW"]="$PANEL" ["m $SELF_WORKFLOW"]="$LOCAL_CALLER" )
+check "runs its own in-repo panel"        m "- local"
 
 # Not parseable. Must not be mistaken for a caller, and must not be written over.
 FILES=( ["l $WORKFLOW"]="{{ this is not yaml" ["l $SELF_WORKFLOW"]="{{ nor is this" )

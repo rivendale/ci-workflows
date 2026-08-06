@@ -151,6 +151,14 @@ is_host_caller() {
   job_uses "$1" | grep -qE "^${HOST}/\.github/workflows/ai-review\.yml@"
 }
 
+# A same-repository reference, which GitHub writes without an @ref. This is a
+# repo running its OWN panel, so it is reported rather than repointed:
+# redirecting it at this host would change behaviour its owner chose, which is
+# the same class of overreach as overwriting an unrelated workflow.
+is_local_caller() {
+  job_uses "$1" | grep -qE '^\./\.github/workflows/ai-review\.yml$'
+}
+
 # Decides where this repo's caller belongs and what state it is in. Echoes
 # "<path> <state>", where state is one of: wired, repoint, add, blocked.
 #
@@ -176,6 +184,8 @@ plan_for() {
     echo "$WORKFLOW repoint"
   elif is_caller "$self_body"; then
     echo "$SELF_WORKFLOW repoint"
+  elif is_local_caller "$body" || is_local_caller "$self_body"; then
+    echo "- local"
   elif [ -z "$body" ]; then
     echo "$WORKFLOW add"
   elif [ -z "$self_body" ]; then
@@ -193,6 +203,8 @@ if [ "$APPLY" != "--apply" ]; then
     read -r path state <<< "$(plan_for "$repo")"
     if [ "$state" = blocked ]; then
       printf '  %-38s %-8s both filenames are taken by non-callers; NEEDS A HUMAN\n' "$repo" "$state"
+    elif [ "$state" = local ]; then
+      printf '  %-38s %-8s runs its own panel in-repo; NEEDS A HUMAN\n' "$repo" "$state"
     else
       printf '  %-38s %-8s %s\n' "$repo" "$state" "$path"
     fi
@@ -207,7 +219,10 @@ for repo in "${REPOS[@]}"; do
   echo "--- $repo"
 
   read -r path action <<< "$(plan_for "$repo")"
-  if [ "$action" = blocked ]; then
+  if [ "$action" = local ]; then
+    echo "    calls its own in-repo panel; repointing it here would change"
+    echo "    behaviour this repo chose. NOT touching it."
+  elif [ "$action" = blocked ]; then
     # Both ai-review.yml and self-review.yml exist and neither is a caller.
     # Writing to either would delete CI this script did not create.
     echo "    ai-review.yml AND self-review.yml are both taken by non-callers; NOT touching this repo"
