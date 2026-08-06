@@ -19,6 +19,7 @@ on:
       - '.github/workflows/self-test.yml'
       - '.github/workflows/self-review.yml'
       - 'scripts/detector-test.sh'
+      - 'scripts/rollout-plan-test.sh'
       - 'scripts/rollout-ai-review.sh'
   push:
     branches: [main]
@@ -39,7 +40,7 @@ jobs:
       - name: Lint the shell
         run: |
           shellcheck --version
-          shellcheck scripts/detector-test.sh scripts/rollout-ai-review.sh
+          shellcheck scripts/detector-test.sh scripts/rollout-ai-review.sh scripts/rollout-plan-test.sh
 
       - name: The panel's YAML parses
         run: |
@@ -84,3 +85,9 @@ jobs:
 
       - name: Detector fixtures and mutations
         run: ./scripts/detector-test.sh
+
+      - name: Rollout plan fixtures and mutations
+        # plan_for decides which file the rollout writes. It has produced two
+        # real bugs, one of which would have overwritten unrelated CI in every
+        # repo that happened to have a self-review.yml.
+        run: ./scripts/rollout-plan-test.sh
