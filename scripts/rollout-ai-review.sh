@@ -103,20 +103,33 @@ file_at() {
 
 # Decides where this repo's caller belongs and what state it is in. Echoes
 # "<path> <state>", where state is one of: wired, repoint, add.
+#
+# BOTH filenames are examined before concluding anything is missing. An earlier
+# version only looked at self-review.yml when ai-review.yml existed and was a
+# panel; once the panel was deleted from rygiel-shared, ai-review.yml was simply
+# absent, so the rollout decided that repo had no caller and opened a PR adding
+# a second one beside the self-review.yml already doing the job. Two callers
+# share a concurrency group, so they would have cancelled each other.
 plan_for() {
-  local repo=$1 path=$WORKFLOW body
+  local repo=$1 body self_body
   body=$(file_at "$repo" "$WORKFLOW")
-  if [ -n "$body" ] && ! printf '%s' "$body" | grep -q 'uses: .*/\.github/workflows/ai-review\.yml'; then
-    # ai-review.yml here is a panel, not a caller. Use the other name.
-    path=$SELF_WORKFLOW
-    body=$(file_at "$repo" "$SELF_WORKFLOW")
-  fi
+  self_body=$(file_at "$repo" "$SELF_WORKFLOW")
+
+  # An existing caller wins, whichever name it goes by.
   if printf '%s' "$body" | grep -q "uses: $HOST/"; then
-    echo "$path wired"
+    echo "$WORKFLOW wired"
+  elif printf '%s' "$self_body" | grep -q "uses: $HOST/"; then
+    echo "$SELF_WORKFLOW wired"
   elif printf '%s' "$body" | grep -q 'uses: '; then
-    echo "$path repoint"
+    echo "$WORKFLOW repoint"
+  elif printf '%s' "$self_body" | grep -q 'uses: '; then
+    echo "$SELF_WORKFLOW repoint"
+  elif [ -n "$body" ]; then
+    # No caller anywhere, and ai-review.yml is taken by something that is not
+    # one -- a panel. Adding there would overwrite it.
+    echo "$SELF_WORKFLOW add"
   else
-    echo "$path add"
+    echo "$WORKFLOW add"
   fi
 }
 
