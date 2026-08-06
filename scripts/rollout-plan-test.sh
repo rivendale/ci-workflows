@@ -12,6 +12,12 @@
 set -uo pipefail
 
 SCRIPT=${1:-"$(dirname "$0")/rollout-ai-review.sh"}
+# Set when this script re-invokes itself to score a mutant. The child must run
+# the FIXTURES ONLY: if it also ran the mutation section, each already-applied
+# mutation would report "did not change the file", and the parent -- which
+# decides by looking for NOT OK -- would read that as a broken fixture and
+# call an ineffective mutation caught.
+FIXTURES_ONLY=${FIXTURES_ONLY:-}
 HOST=rivendale/ci-workflows
 WORKFLOW=.github/workflows/ai-review.yml
 SELF_WORKFLOW=.github/workflows/self-review.yml
@@ -91,21 +97,30 @@ check "both names taken by non-callers"   h "- blocked"
 FILES=( ["i $WORKFLOW"]="$UNRELATED" )
 check "unrelated ai-review.yml"           i "$SELF_WORKFLOW add"
 
+if [ -n "$FIXTURES_ONLY" ]; then
+  printf 'passed %d, failed %d\n' "$pass" "$fail"
+  [ "$fail" -eq 0 ]
+  exit
+fi
+
 echo
-echo "Mutations (each MUST break at least one fixture):"
-mutate() { # name sed-expression
-  local name=$1 expr=$2 mutant
+echo "Mutations:"
+mutate() { # name sed-expression [caught|survives]
+  local name=$1 expr=$2 want=${3:-caught} mutant out
   mutant=$(mktemp); sed "$expr" "$SCRIPT" > "$mutant"
   if cmp -s "$mutant" "$SCRIPT"; then
     echo "  NOT OK $name -- mutation did not change the file"; fail=$((fail + 1)); rm -f "$mutant"; return
   fi
-  local out
-  out=$("$0" "$mutant" 2>&1)
+  out=$(FIXTURES_ONLY=1 "$0" "$mutant" 2>&1)
   rm -f "$mutant"
-  if printf '%s' "$out" | grep -q "NOT OK"; then
-    printf '  ok    %s -- caught\n' "$name"; pass=$((pass + 1))
-  else
+  local got=caught
+  printf '%s' "$out" | grep -q "NOT OK" || got=survives
+  if [ "$got" = "$want" ]; then
+    printf '  ok    %s -- %s\n' "$name" "$got"; pass=$((pass + 1))
+  elif [ "$want" = caught ]; then
     printf '  NOT OK %s -- SURVIVED; the fixtures do not test this\n' "$name"; fail=$((fail + 1))
+  else
+    printf '  NOT OK %s -- was caught, but this mutation changes no behaviour;\n         the harness is reporting failures that are not there\n' "$name"; fail=$((fail + 1))
   fi
 }
 
@@ -123,6 +138,12 @@ mutate "ignore an existing self-review caller" \
 # shellcheck disable=SC2016
 mutate "overwrite when both names are taken" \
   's|^    echo "- blocked"|    echo "$SELF_WORKFLOW add"|'
+
+# Negative control. Editing a comment cannot change a decision, so this MUST
+# survive. If it is reported caught, the harness is manufacturing failures and
+# every "caught" above is worthless.
+mutate "a comment change (control)" \
+  's|^# Decides where this repo|# DECIDES where this repo|' survives
 
 echo
 printf 'passed %d, failed %d\n' "$pass" "$fail"
