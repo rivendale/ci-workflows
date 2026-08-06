@@ -101,16 +101,40 @@ file_at() {
     | tr -d '\n' | base64 -d 2>/dev/null || true
 }
 
-# Is this file a caller for the panel? The test is a job that `uses:` a
-# reusable ai-review workflow -- NOT the mere presence of "uses:", which every
-# workflow on earth contains via actions/checkout. Getting that wrong meant any
-# unrelated self-review.yml was classified as a caller and then overwritten.
-is_caller() {
-  printf '%s' "$1" | grep -qE 'uses: [^/[:space:]]+/[^/[:space:]]+/\.github/workflows/ai-review\.yml@'
+# The `uses:` value of every JOB in a workflow, via a real YAML parse.
+#
+# Grep on the raw text cannot do this correctly, and two review passes proved
+# it. Matching "uses: " anywhere accepts actions/checkout, so every workflow
+# looks like a caller. Tightening the pattern but leaving it unanchored still
+# accepts a comment or a run: block that merely MENTIONS a caller. And any
+# hand-written pattern has to guess how much whitespace YAML allows after the
+# key. A parser knows all three answers.
+#
+# Unparseable input yields nothing, so such a file is never treated as a
+# caller -- and therefore never written over.
+job_uses() {
+  printf '%s' "$1" | python3 -c '
+import sys, yaml
+try:
+    doc = yaml.safe_load(sys.stdin) or {}
+except Exception:
+    sys.exit(0)
+jobs = doc.get("jobs") if isinstance(doc, dict) else None
+if isinstance(jobs, dict):
+    for job in jobs.values():
+        if isinstance(job, dict) and isinstance(job.get("uses"), str):
+            print(job["uses"])
+' 2>/dev/null || true
 }
 
+# Is this file a caller for the panel -- ours or anyone's?
+is_caller() {
+  job_uses "$1" | grep -qE '/\.github/workflows/ai-review\.yml@'
+}
+
+# Is it already calling THIS host?
 is_host_caller() {
-  printf '%s' "$1" | grep -q "uses: $HOST/.github/workflows/ai-review.yml@"
+  job_uses "$1" | grep -qE "^${HOST}/\.github/workflows/ai-review\.yml@"
 }
 
 # Decides where this repo's caller belongs and what state it is in. Echoes

@@ -23,6 +23,7 @@ WORKFLOW=.github/workflows/ai-review.yml
 SELF_WORKFLOW=.github/workflows/self-review.yml
 
 # Pull in is_caller/is_host_caller/plan_for without running the rollout.
+eval "$(sed -n '/^job_uses()/,/^}$/p'        "$SCRIPT")"
 eval "$(sed -n '/^is_caller()/,/^}$/p'      "$SCRIPT")"
 eval "$(sed -n '/^is_host_caller()/,/^}$/p' "$SCRIPT")"
 eval "$(sed -n '/^plan_for()/,/^}$/p'       "$SCRIPT")"
@@ -97,6 +98,30 @@ check "both names taken by non-callers"   h "- blocked"
 FILES=( ["i $WORKFLOW"]="$UNRELATED" )
 check "unrelated ai-review.yml"           i "$SELF_WORKFLOW add"
 
+# A file that only MENTIONS a caller, in a comment and in a run: block. An
+# unanchored text match called this a caller and would have overwritten it.
+MENTIONS="name: Notes
+# previous caller: uses: other/team/.github/workflows/ai-review.yml@main
+on: [pull_request]
+jobs:
+  note:
+    steps:
+      - run: echo 'uses: other/team/.github/workflows/ai-review.yml@main'"
+FILES=( ["j $WORKFLOW"]="$MENTIONS" )
+check "merely mentions a caller"          j "$SELF_WORKFLOW add"
+
+# Valid YAML, just more whitespace after the key. A pattern demanding exactly
+# one space missed this and would have added a SECOND caller alongside it.
+SPACED="jobs:
+  panel:
+    uses:    rivendale/rygiel-shared/.github/workflows/ai-review.yml@main"
+FILES=( ["k $WORKFLOW"]="$SPACED" )
+check "caller with extra whitespace"      k "$WORKFLOW repoint"
+
+# Not parseable. Must not be mistaken for a caller, and must not be written over.
+FILES=( ["l $WORKFLOW"]="{{ this is not yaml" ["l $SELF_WORKFLOW"]="{{ nor is this" )
+check "unparseable on both names"         l "- blocked"
+
 if [ -n "$FIXTURES_ONLY" ]; then
   printf 'passed %d, failed %d\n' "$pass" "$fail"
   [ "$fail" -eq 0 ]
@@ -124,11 +149,13 @@ mutate() { # name sed-expression [caught|survives]
   fi
 }
 
-# The bug the panel caught: "uses:" anywhere counts as a caller.
-# '#' as the delimiter: the line being replaced contains '|' twice, from the
-# shell pipe and from grep -qE's alternation-free but bracketed pattern.
-mutate "treat any 'uses:' as a caller" \
-  's#grep -qE .uses: .*#grep -q "uses: "#'
+# These are sed scripts, not shell expansions.
+# shellcheck disable=SC2016
+# Go back to grepping the raw file instead of the parsed jobs. That is what
+# made a comment mentioning a caller look like one. '#' delimits because the
+# line contains a shell pipe.
+mutate "grep the raw text, not parsed jobs" \
+  's#^  job_uses "$1" | grep#  printf "%s" "$1" | grep#'
 # The bug that opened a duplicate caller: ignore self-review.yml entirely.
 # These are sed scripts, not shell expansions.
 # shellcheck disable=SC2016
