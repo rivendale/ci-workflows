@@ -93,7 +93,50 @@ jobs:
     runs-on: ubuntu-latest
     # Literal, not an expression: job-level timeout-minutes does not accept
     # one, and the run fails at startup with no usable message when it does.
-    timeout-minutes: 15
+    #
+    # BACKSTOP ONLY. The operative budget is on the Review step, and the
+    # difference matters: a JOB timeout is a kill, so GitHub marks the job
+    # `cancelled` and skips every `if: always()` step -- Post the review, Fail
+    # if the reviewer never ran, and the review.md fallback all fail to run.
+    # The PR then gets no comment at all and `gh pr checks` renders the
+    # cancellation as "fail", which reads like a verdict the panel never
+    # reached. Seen on rivendale/rygiel-family#374: three runs cancelled at
+    # exactly 15m10s with nothing posted.
+    #
+    # A STEP timeout fails the step instead, leaving the reporting steps alive.
+    #
+    # The headroom is deliberate and has to be generous. THIS clock starts at
+    # job start; the Review step's 18 starts only after checkout with
+    # fetch-depth: 0, tier selection, Node setup and a global npm install. On a
+    # large repo or a slow runner those can eat many minutes, and if they eat
+    # enough the backstop fires first and recreates the silent cancellation this
+    # change exists to prevent.
+    #
+    # The budget must cover setup AND the review AND the reporting after it.
+    # 35 was still wrong: setup(17) + review(18) lands exactly on the backstop,
+    # so a slow-setup run would be killed the instant the reviewer finished,
+    # before the comment could be posted. Reporting needs its own room.
+    #
+    #   setup  up to ~17   +  review 18  +  reporting ~3   =  38
+    #
+    # 45 leaves margin on top of that. This number must NEVER be the binding
+    # constraint -- if it is ever the one that fires, the panel goes silent
+    # again, so err high. A fix whose correctness depends on which of two
+    # timeouts fires first is not fixed until the ordering is guaranteed rather
+    # than merely likely.
+    #
+    # KNOWN RESIDUAL, stated rather than dropped: this is still ordering, not a
+    # guarantee. A pathologically slow checkout, npm install or GitHub API call
+    # could consume the budget and let the JOB timeout fire, which skips the
+    # reporting steps and reproduces the silent cancellation. The structural fix
+    # is a SEPARATE reporting job (`needs: review, if: always()`) that cannot be
+    # killed by the review job's clock -- it survives any failure of the job it
+    # reports on. Not done here: it needs the report passed between jobs as an
+    # artifact plus its own checkout, which is a larger change with its own new
+    # failure modes, and trading a bounded tested fix for an untested restructure
+    # is how the next 15m10s gets introduced. Raised by ryg-pr-review.sh
+    # 2026-08-08; do it deliberately, not as a footnote to this one.
+    timeout-minutes: 45
     permissions:
       contents: read
       pull-requests: write
@@ -166,6 +209,12 @@ jobs:
 
       - name: Review
         id: review
+        # The operative budget. Deliberately below the job's, so an overrunning
+        # reviewer fails THIS STEP and leaves the reporting steps alive.
+        # 15 was too tight in practice: 15 files / +383 completed while
+        # 19 files / +409 did not, so the ceiling was being hit by ordinary PRs
+        # rather than by pathological ones.
+        timeout-minutes: 18
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MODEL: ${{ steps.tier.outputs.model }}
@@ -292,7 +341,7 @@ jobs:
               echo '```'
               echo
               echo "</details>"
-            } > review.md
+            } > "$RUNNER_TEMP/review.md"
           else
             echo "reviewer_failed=true" >> "$GITHUB_OUTPUT"
             {
@@ -315,23 +364,105 @@ jobs:
               echo '```'
               echo
               echo "</details>"
-            } > review.md
+            } > "$RUNNER_TEMP/review.md"
           fi
-          # Never fail the build on the reviewer's opinion. This panel reports;
-          # the human decides. A reviewer outage must not block a merge.
-          test -s review.md || echo "The reviewer produced no output." > review.md
+          # Never fail the build on the reviewer's OPINION -- this panel
+          # reports, the human decides. A review that did not HAPPEN is the
+          # opposite case and does fail, through reviewer_failed above and the
+          # step below. The previous wording here said the reverse; a comment
+          # asserting a guarantee the code does not give is how the claude-rc
+          # StandardError bug survived on three hosts.
+          #
+          # Written to RUNNER_TEMP, never the workspace. A caller PR can commit
+          # its own review.md at the repo root, and checkout would place it right
+          # where the reporting step looks -- so a Review step that died before
+          # writing its own would have had PR-authored text posted under the
+          # panel's name. RUNNER_TEMP is outside the checkout and a PR cannot
+          # reach it. (verdict.md and transcript.md stay in the workspace safely:
+          # both are truncated with `: >` before use.)
+          test -s "$RUNNER_TEMP/review.md" \
+            || echo "The reviewer produced no output." > "$RUNNER_TEMP/review.md"
 
       - name: Post the review
-        if: always()
+        # NOT always(). `concurrency: cancel-in-progress` kills the older run
+        # when a new push arrives, and always() would let that dead run reach
+        # this step, find outcome=cancelled, and overwrite the marker comment
+        # with "not reviewed" -- potentially AFTER the newer run posted a real
+        # review. That turns a reviewed PR into an apparently unreviewed one,
+        # which is a worse version of the bug this branch is fixing.
+        #
+        # !cancelled() keeps every case this change exists for: a step-level
+        # timeout is a FAILURE, not a cancellation, so the timeout report still
+        # posts. Only superseded runs stay quiet, which is what they should do.
+        if: ${{ !cancelled() }}
         uses: actions/github-script@v7
         env:
           MODEL: ${{ steps.tier.outputs.model }}
           EFFORT: ${{ steps.tier.outputs.effort }}
           REASON: ${{ steps.tier.outputs.reason }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
         with:
           script: |
             const fs = require('fs');
-            const body = fs.readFileSync('review.md', 'utf8').slice(0, 60000);
+            // This step runs under always(), so it is the one thing that still
+            // speaks when the reviewer does not. It must therefore never throw:
+            // if it dies, the PR goes silent and the bare check result gets read
+            // as a verdict, which is the failure this whole file is guarding.
+            //
+            // Gate on the Review step's OUTCOME, not on the file existing.
+            // `} > file` creates and truncates the target the moment the output
+            // block starts, so a step killed mid-write leaves a file that is
+            // present but PARTIAL -- and a half-written review posted under the
+            // panel's marker reads as a complete verdict, which is worse than
+            // posting nothing. Only a step that finished can have produced a
+            // whole report. The reviewer_failed path still counts as success:
+            // it exits 0 and writes a deliberate diagnostic.
+            const outcome = process.env.REVIEW_OUTCOME || 'unknown';
+            let raw = null;
+            if (outcome === 'success') {
+              try {
+                raw = fs.readFileSync(`${process.env.RUNNER_TEMP}/review.md`, 'utf8');
+              } catch { raw = null; }
+            }
+            let body;
+            if (raw && raw.trim()) {
+              body = raw.slice(0, 60000);
+            } else {
+              // Report what is KNOWN, never a guessed cause. There is more than
+              // one way to arrive here and only one of them is a timeout: if
+              // checkout, base materialisation, tier selection or the reviewer
+              // install failed, the Review step is `skipped` and never started.
+              // Asserting "exceeded its time budget" there would put a false
+              // statement on the PR -- the same defect class this whole change
+              // exists to remove.
+              // "did not run" is only true for `skipped`. On a step timeout the
+              // reviewer may well have run and produced a verdict -- what failed
+              // was assembling a complete report, and a partial one is not safe
+              // to publish. Claiming it never ran would be another false
+              // statement, just a subtler one.
+              const started = outcome !== 'skipped';
+              const why = {
+                skipped: 'a step before the reviewer failed, so it never started',
+                success: 'the step finished but left no readable report',
+              }[outcome] || 'the step did not finish — most often its time budget';
+              body = [
+                started
+                  ? '**No complete review was produced. This PR has _not_ been reviewed.**'
+                  : '**The review never started. This PR has _not_ been reviewed.**',
+                '',
+                `Review step outcome: \`${outcome}\` — ${why}.`,
+                '',
+                started
+                  ? 'The reviewer may have begun work, but no whole report survived, and a'
+                  : 'Nothing ran, so there is no partial result either, and a'
+                , 'partial review must not be posted as if it were a verdict.',
+                '',
+                'Treat this as **absence of a review**, not as findings. There is nothing here',
+                'to go looking for.',
+                '',
+                'Re-run the job, or review locally with `ryg-pr-review.sh <PR>` and say so on the PR.',
+              ].join('\n');
+            }
             const marker = '<!-- rivendale-ai-review -->';
             const header = `${marker}\n### AI review panel — \`${process.env.MODEL}\` (effort ${process.env.EFFORT})\n_Tier chosen because: ${process.env.REASON}._\n\n`;
 
