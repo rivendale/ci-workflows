@@ -104,8 +104,15 @@ jobs:
     # exactly 15m10s with nothing posted.
     #
     # A STEP timeout fails the step instead, leaving the reporting steps alive.
-    # Keep this comfortably above the step budget so it never fires first.
-    timeout-minutes: 25
+    #
+    # The headroom is deliberate and has to be generous. THIS clock starts at
+    # job start; the Review step's 18 starts only after checkout with
+    # fetch-depth: 0, tier selection, Node setup and a global npm install. On a
+    # large repo or a slow runner those can eat many minutes, and if they eat
+    # enough the backstop fires first and recreates the silent cancellation this
+    # change exists to prevent. 35 - 18 leaves 17 minutes of setup before the
+    # wrong timeout wins.
+    timeout-minutes: 35
     permissions:
       contents: read
       pull-requests: write
@@ -310,7 +317,7 @@ jobs:
               echo '```'
               echo
               echo "</details>"
-            } > review.md
+            } > "$RUNNER_TEMP/review.md"
           else
             echo "reviewer_failed=true" >> "$GITHUB_OUTPUT"
             {
@@ -333,7 +340,7 @@ jobs:
               echo '```'
               echo
               echo "</details>"
-            } > review.md
+            } > "$RUNNER_TEMP/review.md"
           fi
           # Never fail the build on the reviewer's OPINION -- this panel
           # reports, the human decides. A review that did not HAPPEN is the
@@ -341,7 +348,16 @@ jobs:
           # step below. The previous wording here said the reverse; a comment
           # asserting a guarantee the code does not give is how the claude-rc
           # StandardError bug survived on three hosts.
-          test -s review.md || echo "The reviewer produced no output." > review.md
+          #
+          # Written to RUNNER_TEMP, never the workspace. A caller PR can commit
+          # its own review.md at the repo root, and checkout would place it right
+          # where the reporting step looks -- so a Review step that died before
+          # writing its own would have had PR-authored text posted under the
+          # panel's name. RUNNER_TEMP is outside the checkout and a PR cannot
+          # reach it. (verdict.md and transcript.md stay in the workspace safely:
+          # both are truncated with `: >` before use.)
+          test -s "$RUNNER_TEMP/review.md" \
+            || echo "The reviewer produced no output." > "$RUNNER_TEMP/review.md"
 
       - name: Post the review
         if: always()
@@ -360,7 +376,7 @@ jobs:
             // catch is what turns a timeout into a stated result.
             let body;
             try {
-              body = fs.readFileSync('review.md', 'utf8').slice(0, 60000);
+              body = fs.readFileSync(`${process.env.RUNNER_TEMP}/review.md`, 'utf8').slice(0, 60000);
             } catch {
               body = [
                 '**The review did not run: the reviewer exceeded its time budget.**',
