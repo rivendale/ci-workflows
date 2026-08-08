@@ -382,26 +382,42 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            // review.md is written at the END of the Review step, so a step
-            // timeout terminates before it exists and readFileSync throws --
-            // which would take this step down too and leave the PR silent, the
-            // exact outcome the step budget was introduced to prevent. The
-            // catch is what turns a timeout into a stated result.
+            // This step runs under always(), so it is the one thing that still
+            // speaks when the reviewer does not. It must therefore never throw:
+            // if it dies, the PR goes silent and the bare check result gets read
+            // as a verdict, which is the failure this whole file is guarding.
+            //
+            // Gate on the Review step's OUTCOME, not on the file existing.
+            // `} > file` creates and truncates the target the moment the output
+            // block starts, so a step killed mid-write leaves a file that is
+            // present but PARTIAL -- and a half-written review posted under the
+            // panel's marker reads as a complete verdict, which is worse than
+            // posting nothing. Only a step that finished can have produced a
+            // whole report. The reviewer_failed path still counts as success:
+            // it exits 0 and writes a deliberate diagnostic.
+            const outcome = process.env.REVIEW_OUTCOME || 'unknown';
+            let raw = null;
+            if (outcome === 'success') {
+              try {
+                raw = fs.readFileSync(`${process.env.RUNNER_TEMP}/review.md`, 'utf8');
+              } catch { raw = null; }
+            }
             let body;
-            try {
-              body = fs.readFileSync(`${process.env.RUNNER_TEMP}/review.md`, 'utf8').slice(0, 60000);
-            } catch {
-              // Report what is KNOWN, never a guessed cause. This catch fires
-              // whenever no result exists, and that is not always a timeout: if
+            if (raw && raw.trim()) {
+              body = raw.slice(0, 60000);
+            } else {
+              // Report what is KNOWN, never a guessed cause. There is more than
+              // one way to arrive here and only one of them is a timeout: if
               // checkout, base materialisation, tier selection or the reviewer
               // install failed, the Review step is `skipped` and never started.
               // Asserting "exceeded its time budget" there would put a false
               // statement on the PR -- the same defect class this whole change
               // exists to remove.
-              const outcome = process.env.REVIEW_OUTCOME || 'unknown';
-              const why = outcome === 'skipped'
-                ? 'a step before the reviewer failed, so it never started'
-                : 'the reviewer produced no result — most often the step exceeding its time budget';
+              const why = {
+                skipped: 'a step before the reviewer failed, so it never started',
+                cancelled: 'the run was cancelled',
+                success: 'the step finished but left no readable report',
+              }[outcome] || 'no result was produced — most often the step exceeding its time budget';
               body = [
                 '**The review did not run. This PR has _not_ been reviewed.**',
                 '',
