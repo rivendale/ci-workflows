@@ -124,6 +124,18 @@ jobs:
     # again, so err high. A fix whose correctness depends on which of two
     # timeouts fires first is not fixed until the ordering is guaranteed rather
     # than merely likely.
+    #
+    # KNOWN RESIDUAL, stated rather than dropped: this is still ordering, not a
+    # guarantee. A pathologically slow checkout, npm install or GitHub API call
+    # could consume the budget and let the JOB timeout fire, which skips the
+    # reporting steps and reproduces the silent cancellation. The structural fix
+    # is a SEPARATE reporting job (`needs: review, if: always()`) that cannot be
+    # killed by the review job's clock -- it survives any failure of the job it
+    # reports on. Not done here: it needs the report passed between jobs as an
+    # artifact plus its own checkout, which is a larger change with its own new
+    # failure modes, and trading a bounded tested fix for an untested restructure
+    # is how the next 15m10s gets introduced. Raised by ryg-pr-review.sh
+    # 2026-08-08; do it deliberately, not as a footnote to this one.
     timeout-minutes: 45
     permissions:
       contents: read
@@ -372,7 +384,17 @@ jobs:
             || echo "The reviewer produced no output." > "$RUNNER_TEMP/review.md"
 
       - name: Post the review
-        if: always()
+        # NOT always(). `concurrency: cancel-in-progress` kills the older run
+        # when a new push arrives, and always() would let that dead run reach
+        # this step, find outcome=cancelled, and overwrite the marker comment
+        # with "not reviewed" -- potentially AFTER the newer run posted a real
+        # review. That turns a reviewed PR into an apparently unreviewed one,
+        # which is a worse version of the bug this branch is fixing.
+        #
+        # !cancelled() keeps every case this change exists for: a step-level
+        # timeout is a FAILURE, not a cancellation, so the timeout report still
+        # posts. Only superseded runs stay quiet, which is what they should do.
+        if: ${{ !cancelled() }}
         uses: actions/github-script@v7
         env:
           MODEL: ${{ steps.tier.outputs.model }}
@@ -413,18 +435,30 @@ jobs:
               // Asserting "exceeded its time budget" there would put a false
               // statement on the PR -- the same defect class this whole change
               // exists to remove.
+              // "did not run" is only true for `skipped`. On a step timeout the
+              // reviewer may well have run and produced a verdict -- what failed
+              // was assembling a complete report, and a partial one is not safe
+              // to publish. Claiming it never ran would be another false
+              // statement, just a subtler one.
+              const started = outcome !== 'skipped';
               const why = {
                 skipped: 'a step before the reviewer failed, so it never started',
-                cancelled: 'the run was cancelled',
                 success: 'the step finished but left no readable report',
-              }[outcome] || 'no result was produced — most often the step exceeding its time budget';
+              }[outcome] || 'the step did not finish — most often its time budget';
               body = [
-                '**The review did not run. This PR has _not_ been reviewed.**',
+                started
+                  ? '**No complete review was produced. This PR has _not_ been reviewed.**'
+                  : '**The review never started. This PR has _not_ been reviewed.**',
                 '',
                 `Review step outcome: \`${outcome}\` — ${why}.`,
                 '',
-                'This is not a finding and not a verdict. The panel was stopped before it',
-                'reached one, so there is nothing here to go looking for.',
+                started
+                  ? 'The reviewer may have begun work, but no whole report survived, and a'
+                  : 'Nothing ran, so there is no partial result either, and a'
+                , 'partial review must not be posted as if it were a verdict.',
+                '',
+                'Treat this as **absence of a review**, not as findings. There is nothing here',
+                'to go looking for.',
                 '',
                 'Re-run the job, or review locally with `ryg-pr-review.sh <PR>` and say so on the PR.',
               ].join('\n');
