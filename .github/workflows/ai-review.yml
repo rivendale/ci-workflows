@@ -110,9 +110,21 @@ jobs:
     # fetch-depth: 0, tier selection, Node setup and a global npm install. On a
     # large repo or a slow runner those can eat many minutes, and if they eat
     # enough the backstop fires first and recreates the silent cancellation this
-    # change exists to prevent. 35 - 18 leaves 17 minutes of setup before the
-    # wrong timeout wins.
-    timeout-minutes: 35
+    # change exists to prevent.
+    #
+    # The budget must cover setup AND the review AND the reporting after it.
+    # 35 was still wrong: setup(17) + review(18) lands exactly on the backstop,
+    # so a slow-setup run would be killed the instant the reviewer finished,
+    # before the comment could be posted. Reporting needs its own room.
+    #
+    #   setup  up to ~17   +  review 18  +  reporting ~3   =  38
+    #
+    # 45 leaves margin on top of that. This number must NEVER be the binding
+    # constraint -- if it is ever the one that fires, the panel goes silent
+    # again, so err high. A fix whose correctness depends on which of two
+    # timeouts fires first is not fixed until the ordering is guaranteed rather
+    # than merely likely.
+    timeout-minutes: 45
     permissions:
       contents: read
       pull-requests: write
@@ -366,6 +378,7 @@ jobs:
           MODEL: ${{ steps.tier.outputs.model }}
           EFFORT: ${{ steps.tier.outputs.effort }}
           REASON: ${{ steps.tier.outputs.reason }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
         with:
           script: |
             const fs = require('fs');
@@ -378,11 +391,24 @@ jobs:
             try {
               body = fs.readFileSync(`${process.env.RUNNER_TEMP}/review.md`, 'utf8').slice(0, 60000);
             } catch {
+              // Report what is KNOWN, never a guessed cause. This catch fires
+              // whenever no result exists, and that is not always a timeout: if
+              // checkout, base materialisation, tier selection or the reviewer
+              // install failed, the Review step is `skipped` and never started.
+              // Asserting "exceeded its time budget" there would put a false
+              // statement on the PR -- the same defect class this whole change
+              // exists to remove.
+              const outcome = process.env.REVIEW_OUTCOME || 'unknown';
+              const why = outcome === 'skipped'
+                ? 'a step before the reviewer failed, so it never started'
+                : 'the reviewer produced no result — most often the step exceeding its time budget';
               body = [
-                '**The review did not run: the reviewer exceeded its time budget.**',
+                '**The review did not run. This PR has _not_ been reviewed.**',
                 '',
-                'This PR has **not** been reviewed. This is not a finding and not a verdict —',
-                'the panel was stopped before it produced one.',
+                `Review step outcome: \`${outcome}\` — ${why}.`,
+                '',
+                'This is not a finding and not a verdict. The panel was stopped before it',
+                'reached one, so there is nothing here to go looking for.',
                 '',
                 'Re-run the job, or review locally with `ryg-pr-review.sh <PR>` and say so on the PR.',
               ].join('\n');
