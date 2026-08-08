@@ -93,7 +93,19 @@ jobs:
     runs-on: ubuntu-latest
     # Literal, not an expression: job-level timeout-minutes does not accept
     # one, and the run fails at startup with no usable message when it does.
-    timeout-minutes: 15
+    #
+    # BACKSTOP ONLY. The operative budget is on the Review step, and the
+    # difference matters: a JOB timeout is a kill, so GitHub marks the job
+    # `cancelled` and skips every `if: always()` step -- Post the review, Fail
+    # if the reviewer never ran, and the review.md fallback all fail to run.
+    # The PR then gets no comment at all and `gh pr checks` renders the
+    # cancellation as "fail", which reads like a verdict the panel never
+    # reached. Seen on rivendale/rygiel-family#374: three runs cancelled at
+    # exactly 15m10s with nothing posted.
+    #
+    # A STEP timeout fails the step instead, leaving the reporting steps alive.
+    # Keep this comfortably above the step budget so it never fires first.
+    timeout-minutes: 25
     permissions:
       contents: read
       pull-requests: write
@@ -166,6 +178,12 @@ jobs:
 
       - name: Review
         id: review
+        # The operative budget. Deliberately below the job's, so an overrunning
+        # reviewer fails THIS STEP and leaves the reporting steps alive.
+        # 15 was too tight in practice: 15 files / +383 completed while
+        # 19 files / +409 did not, so the ceiling was being hit by ordinary PRs
+        # rather than by pathological ones.
+        timeout-minutes: 18
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MODEL: ${{ steps.tier.outputs.model }}
@@ -317,8 +335,12 @@ jobs:
               echo "</details>"
             } > review.md
           fi
-          # Never fail the build on the reviewer's opinion. This panel reports;
-          # the human decides. A reviewer outage must not block a merge.
+          # Never fail the build on the reviewer's OPINION -- this panel
+          # reports, the human decides. A review that did not HAPPEN is the
+          # opposite case and does fail, through reviewer_failed above and the
+          # step below. The previous wording here said the reverse; a comment
+          # asserting a guarantee the code does not give is how the claude-rc
+          # StandardError bug survived on three hosts.
           test -s review.md || echo "The reviewer produced no output." > review.md
 
       - name: Post the review
@@ -331,7 +353,24 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const body = fs.readFileSync('review.md', 'utf8').slice(0, 60000);
+            // review.md is written at the END of the Review step, so a step
+            // timeout terminates before it exists and readFileSync throws --
+            // which would take this step down too and leave the PR silent, the
+            // exact outcome the step budget was introduced to prevent. The
+            // catch is what turns a timeout into a stated result.
+            let body;
+            try {
+              body = fs.readFileSync('review.md', 'utf8').slice(0, 60000);
+            } catch {
+              body = [
+                '**The review did not run: the reviewer exceeded its time budget.**',
+                '',
+                'This PR has **not** been reviewed. This is not a finding and not a verdict —',
+                'the panel was stopped before it produced one.',
+                '',
+                'Re-run the job, or review locally with `ryg-pr-review.sh <PR>` and say so on the PR.',
+              ].join('\n');
+            }
             const marker = '<!-- rivendale-ai-review -->';
             const header = `${marker}\n### AI review panel — \`${process.env.MODEL}\` (effort ${process.env.EFFORT})\n_Tier chosen because: ${process.env.REASON}._\n\n`;
 
