@@ -153,3 +153,7 @@ bills.
 
 The review never fails the build. It reports, and a person decides; a reviewer
 outage must not block a merge.
+
+## License
+
+Licensed under either of [MIT No Attribution](LICENSE-MIT-0) or [Apache License 2.0](LICENSE-APACHE), at your option.
