@@ -91,13 +91,31 @@ exact self-match. It then mutates the logic and asserts each mutation breaks a
 fixture, so a check that has quietly become unreachable fails loudly instead of
 passing by accident. `Self-test` runs it on every PR that touches the panel.
 
+## What gets posted
+
+The PR comment carries the finished review and nothing else. The working
+transcript holds whatever the reviewer's commands printed, so it goes to the
+job log, inside `::stop-commands::` so a line from the PR cannot act as a
+workflow command. Both pass through `redact()` first: it replaces the step's
+own secrets verbatim and anything shaped like a common key or token. GitHub
+masks registered secrets in logs, but not in comments made through the API,
+which is why the comment must never carry raw command output.
+
+The reviewer also gets as little as possible to leak. Checkout does not persist
+the token in `.git/config`, the key is removed from the reviewer's environment
+(the CLI uses the credential `codex login` stored), and that stored credential
+is deleted as soon as the review finishes. The reviewer can still read the
+stored credential while it runs; redaction is the backstop for that.
+`scripts/redact-test.sh` lifts `redact()` out of the workflow and runs it
+against fixtures and mutations, as `detector-test.sh` does for the detector.
+
 ## Sandbox
 
 The reviewer runs with its own sandbox disabled. Bubblewrap cannot configure a
 network namespace inside a GitHub runner, and every git command the reviewer
 tried failed with `bwrap: loopback: Failed RTM_NEWADDR`. The runner is already
-the isolation boundary: ephemeral, per job, holding a read-scoped token and the
-review key and nothing else.
+the isolation boundary: ephemeral, per job, holding the review key and nothing
+else that persists past checkout (see [What gets posted](#what-gets-posted)).
 
 The residual risk is a prompt injection in a trusted-branch PR getting the
 reviewer to run something on the runner. Fork pull requests do not receive

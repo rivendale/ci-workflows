@@ -145,10 +145,20 @@ jobs:
         with:
           # The reviewer diffs against the base branch, so it needs history.
           fetch-depth: 0
+          # The reviewer runs model-chosen commands unsandboxed. A persisted
+          # token would sit in .git/config where any of those commands can
+          # read it. Nothing after checkout needs it: fetch-depth 0 already
+          # brought every branch, and the base step below falls back to the
+          # local origin/<base> ref when its fetch cannot authenticate.
+          persist-credentials: false
 
       - name: Materialise the base branch
         env:
           BASE: ${{ inputs.base }}
+          # Checkout no longer leaves a token behind, so on a private repo the
+          # fetch below cannot authenticate. It must fail at once, not wait for
+          # a username, and fall through to the local origin/<base> ref.
+          GIT_TERMINAL_PROMPT: '0'
         run: |
           set -euo pipefail
           # checkout leaves a detached HEAD at the PR's merge ref, so there is no
@@ -281,7 +291,10 @@ jobs:
           codex_status=0
           set +e
           if [ "$login_status" -eq 0 ]; then
-            codex review \
+            # The CLI authenticates from the credential `codex login` stored,
+            # so the key is removed from the reviewer's own environment: a
+            # command it runs (`env`, `printenv`) then has nothing to print.
+            env -u OPENAI_API_KEY codex review \
               --base "$BASE" \
               --title "$TITLE" \
               -c sandbox_mode="danger-full-access" \
@@ -290,7 +303,58 @@ jobs:
               > verdict.md 2> transcript.md
             codex_status=$?
           fi
+          # The stored credential is only needed while the reviewer runs.
+          # Remove it before anything below reads or publishes output.
+          codex logout > /dev/null 2>&1
+          rm -f "${CODEX_HOME:-$HOME/.codex}/auth.json"
           set -e
+
+          # Everything this step publishes goes through redact first. The
+          # verdict is model output, and the model read a PR it does not
+          # trust; a prompt injection that got it to print a credential must
+          # not be able to post that credential as a PR comment. GitHub masks
+          # registered secrets in LOGS only, not in comments made through the
+          # API. Exact values of the step's own secrets are replaced, then
+          # anything shaped like a common key or token.
+          # Tested by scripts/redact-test.sh, which lifts this function out.
+          redact() { # in-file out-file
+            REDACT_IN="$1" REDACT_OUT="$2" python3 - <<'PY'
+          import os, re
+          text = open(os.environ['REDACT_IN'], encoding='utf-8', errors='replace').read()
+          n = 0
+          for name in ('OPENAI_API_KEY', 'GITHUB_TOKEN', 'GH_TOKEN'):
+              value = (os.environ.get(name) or '').strip()
+              if len(value) >= 8 and value in text:
+                  n += text.count(value)
+                  text = text.replace(value, '[REDACTED]')
+          patterns = [
+              r'-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)',
+              r'\bsk-[A-Za-z0-9_-]{16,}',
+              r'\bgh[pousr]_[A-Za-z0-9]{20,}',
+              r'\bgithub_pat_[A-Za-z0-9_]{20,}',
+              r'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b',
+              r'\bxox[abposr]-[A-Za-z0-9-]{10,}',
+              r'\bAIza[0-9A-Za-z_-]{35}',
+              r'\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}',
+          ]
+          for pattern in patterns:
+              text, k = re.subn(pattern, '[REDACTED]', text)
+              n += k
+          # Keep the label, drop the value: `Authorization: Bearer x`, and
+          # `"api_key": "x"` or `OPENAI_API_KEY=x` as auth files and env dumps
+          # print them.
+          keyed = [
+              r'(?i)(authorization:\s*(?:bearer|basic|token)\s+)[^\s"\']{8,}',
+              r'(?i)("[a-z_]*(?:api_key|token|secret|password)"\s*:\s*")[^"]{8,}(?=")',
+              r'(?m)^(\s*(?:export\s+)?[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)\s*=\s*)\S{8,}',
+          ]
+          for pattern in keyed:
+              text, k = re.subn(pattern, r'\1[REDACTED]', text)
+              n += k
+          open(os.environ['REDACT_OUT'], 'w', encoding='utf-8').write(text)
+          print(f'redact: {n} replacement(s) in {os.path.basename(os.environ["REDACT_IN"])}')
+          PY
+          }
 
           # Did the reviewer actually run? Opinions never fail the build; this
           # does, because a review that did not happen must not read as a clean
@@ -320,27 +384,38 @@ jobs:
             reviewer_failed="the reviewer produced no review"
           fi
 
+          # The transcript is diagnostics, not part of the verdict, and it holds
+          # whatever the reviewer's commands printed. It goes to this job's log
+          # (redacted, and GitHub masks registered secrets there too), never to
+          # the PR.
+          redact transcript.md transcript-redacted.md
+          redact login.log login-redacted.log
+          redact verdict.md verdict-redacted.md
+
           if [ -z "$reviewer_failed" ]; then
-            # Lead with the review. Keep the transcript, since it is what makes
-            # a wrong review diagnosable, but fold it away; drop the banner,
-            # which is just the tool announcing itself.
+            # Post the review alone. The transcript is what makes a wrong
+            # review diagnosable, so it is kept in the job log; drop the
+            # banner, which is just the tool announcing itself.
             sed -e '/^OpenAI Codex v/d' \
                 -e '/^workdir:/d' -e '/^model:/d' -e '/^provider:/d' \
                 -e '/^approval:/d' -e '/^sandbox:/d' -e '/^reasoning /d' \
                 -e '/^session id:/d' -e '/^--------$/d' \
                 -e '/could not find bubblewrap/d' \
                 -e '/^user$/d' -e "/^changes against/d" \
-                transcript.md | sed '/./,$!d' > transcript-clean.md
+                transcript-redacted.md | sed '/./,$!d' > transcript-clean.md
+            # stop-commands: the transcript is text the PR influenced, and a
+            # line in it starting with `::` must not run as a workflow command.
+            stop=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+            echo "::group::Reviewer transcript (last 20000 bytes, redacted)"
+            echo "::stop-commands::$stop"
+            tail -c 20000 transcript-clean.md
+            echo
+            echo "::$stop::"
+            echo "::endgroup::"
             {
-              cat verdict.md
+              cat verdict-redacted.md
               echo
-              echo "<details><summary>How it got there</summary>"
-              echo
-              echo '```'
-              tail -c 20000 transcript-clean.md
-              echo '```'
-              echo
-              echo "</details>"
+              echo "_How it got there: the reviewer's working transcript is in this run's job log, under the Review step._"
             } > "$RUNNER_TEMP/review.md"
           else
             echo "reviewer_failed=true" >> "$GITHUB_OUTPUT"
@@ -353,18 +428,23 @@ jobs:
               echo
               echo "Login status: \`$login_status\` | review exit: \`$codex_status\` | key characters seen: \`$key_chars\`"
               echo
-              if [ -s login.log ]; then
+              if [ -s login-redacted.log ]; then
                 echo '```'
-                tail -c 800 login.log
+                tail -c 800 login-redacted.log
                 echo '```'
                 echo
               fi
-              echo '```'
-              tail -c 4000 transcript.md
-              echo '```'
+              echo "The reviewer's transcript is in this run's job log, under the Review step."
               echo
               echo "</details>"
             } > "$RUNNER_TEMP/review.md"
+            stop=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+            echo "::group::Reviewer transcript (last 4000 bytes, redacted)"
+            echo "::stop-commands::$stop"
+            tail -c 4000 transcript-redacted.md
+            echo
+            echo "::$stop::"
+            echo "::endgroup::"
           fi
           # Never fail the build on the reviewer's OPINION -- this panel
           # reports, the human decides. A review that did not HAPPEN is the
@@ -379,7 +459,8 @@ jobs:
           # writing its own would have had PR-authored text posted under the
           # panel's name. RUNNER_TEMP is outside the checkout and a PR cannot
           # reach it. (verdict.md and transcript.md stay in the workspace safely:
-          # both are truncated with `: >` before use.)
+          # both are truncated with `: >` before use, and redact rewrites the
+          # *-redacted copies on every run.)
           test -s "$RUNNER_TEMP/review.md" \
             || echo "The reviewer produced no output." > "$RUNNER_TEMP/review.md"
 

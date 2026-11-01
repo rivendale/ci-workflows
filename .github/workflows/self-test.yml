@@ -21,6 +21,7 @@ on:
       - 'scripts/detector-test.sh'
       - 'scripts/rollout-plan-test.sh'
       - 'scripts/rollout-ai-review.sh'
+      - 'scripts/redact-test.sh'
   push:
     branches: [main]
 
@@ -40,7 +41,7 @@ jobs:
       - name: Lint the shell
         run: |
           shellcheck --version
-          shellcheck scripts/detector-test.sh scripts/rollout-ai-review.sh scripts/rollout-plan-test.sh
+          shellcheck scripts/detector-test.sh scripts/rollout-ai-review.sh scripts/rollout-plan-test.sh scripts/redact-test.sh
 
       - name: The panel's YAML parses
         run: |
@@ -85,6 +86,13 @@ jobs:
 
       - name: Detector fixtures and mutations
         run: ./scripts/detector-test.sh
+
+      - name: Redaction fixtures and mutations
+        # Everything the panel posts goes through redact(). A PR comment is
+        # public on a public repo and GitHub does not mask secrets there, so a
+        # redactor that quietly stopped matching would publish the next key a
+        # prompt-injected reviewer printed.
+        run: ./scripts/redact-test.sh
 
       - name: Rollout plan fixtures and mutations
         # plan_for decides which file the rollout writes. It has produced two
