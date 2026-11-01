@@ -94,7 +94,7 @@ guard() { # name value expected_login_status
   # codex reads it; a stub that does not was measuring its own shortcut.
   # login_status is set by the sourced guard, at a path the linter cannot
   # follow, and read back out of the same subshell.
-  # shellcheck disable=SC2030,SC2031,SC2317,SC1091
+  # shellcheck disable=SC2030,SC2031,SC2317,SC2329,SC1091
   got=$( export OPENAI_API_KEY="$2"
          codex() { cat > /dev/null; echo "Successfully logged in"; return 0; }
          cd "$WORK" && . ./guard.sh >/dev/null 2>&1
