@@ -1,0 +1,8 @@
+# Moves the commit SHA pins in the workflows. The review panel still skips
+# Dependabot pull requests, so these bumps are reviewed by a person.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
